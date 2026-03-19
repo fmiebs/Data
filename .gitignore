@@ -1,0 +1,18 @@
+# API-Keys
+.env
+**/.env
+
+# Python
+.idea/
+__pycache__/
+.venv*/
+
+# LaTeX Müll (WICHTIG)
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.pdf
+*.synctex.gz

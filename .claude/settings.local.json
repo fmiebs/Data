@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd C:/Users/Miebs/PycharmProjects/Data && python - <<'EOF'\nfrom config.db import engine\nfrom sqlalchemy import text\n\nwith engine.connect\\(\\) as conn:\n    rows = conn.execute\\(text\\(\"SELECT index_ric, option_chain_ric FROM pub_equity.index_overview\"\\)\\).fetchall\\(\\)\n    for r in rows:\n        print\\(r\\)\nEOF)",
+      "Bash(cd C:/Users/Miebs/PycharmProjects/Data && python - <<'EOF'\nfrom config.db import engine\nfrom sqlalchemy import text\n\nwith engine.connect\\(\\) as conn:\n    conn.execute\\(text\\(\"UPDATE pub_equity.index_overview SET option_chain_ric = 'DJX*.U' WHERE index_ric = '.DJI'\"\\)\\)\n    conn.commit\\(\\)\n    print\\(\"Fixed: .DJI option_chain_ric = 'DJX*.U'\"\\)\nEOF)",
+      "Bash(cd C:/Users/Miebs/PycharmProjects/Data && python -u run_monthly.py 2>&1)"
+    ]
+  }
+}

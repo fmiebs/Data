@@ -69,7 +69,10 @@ def run(snapshot_date: str | None = None) -> None:
 
     with engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT index_ric FROM pub_equity.index_overview")
+            text(
+                "SELECT index_ric FROM pub_equity.index_overview "
+                "WHERE get_constituents = TRUE"
+            )
         ).fetchall()
 
     index_rics = [r[0] for r in rows]

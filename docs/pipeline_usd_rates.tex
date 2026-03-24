@@ -1,0 +1,421 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[ngerman]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{parskip}
+\usepackage{microtype}
+
+\geometry{margin=2.5cm}
+
+\definecolor{codebg}{gray}{0.95}
+\definecolor{codecomment}{rgb}{0.4,0.4,0.4}
+\definecolor{codestring}{rgb}{0.13,0.54,0.13}
+\definecolor{codekeyword}{rgb}{0.0,0.0,0.6}
+
+\lstset{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekeyword}\bfseries,
+  commentstyle=\color{codecomment}\itshape,
+  stringstyle=\color{codestring},
+  breaklines=true,
+  frame=single,
+  framerule=0pt,
+  rulecolor=\color{codebg},
+  xleftmargin=1em,
+  xrightmargin=1em,
+  aboveskip=0.8em,
+  belowskip=0.8em,
+}
+
+\lstdefinestyle{sql}{
+  language=SQL,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekeyword}\bfseries,
+  breaklines=true,
+  frame=single,
+  framerule=0pt,
+  rulecolor=\color{codebg},
+  xleftmargin=1em,
+  xrightmargin=1em,
+}
+
+\title{\textbf{Pipeline-Dokumentation: USD Risk-Free Rate Curve}\\
+       \large Projekt \texttt{research\_db} --- Modul 5}
+\author{Research-Datenbank-Projekt}
+\date{\today}
+
+% ============================================================
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Zweck und Einordnung}
+
+Dieses Dokument beschreibt die Implementierung und das Design der
+USD-Zinskurven-Pipeline im Rahmen des \texttt{research\_db}-Projekts.
+
+Die tägliche USD Risk-Free Rate Curve liefert die Grundlage für die
+Diskontierung von Cashflows in der stocklevel SVIX-Pipeline
+\cite{martinwagner2019}. Konkret wird die Kurve für folgende Zwecke
+verwendet:
+
+\begin{itemize}
+  \item Diskontierung im CRR/Leisen-Reimer Binomialbaum zur Berechnung
+        europäisch-äquivalenter Optionspreise.
+  \item Interpolation des risikofreien Zinssatzes für beliebige
+        Optionslaufzeiten~$\tau$.
+  \item Ersatz des bisherigen Hilfsverfahrens (SPX Put-Call-Parität als
+        Proxy für den Diskontfaktor).
+\end{itemize}
+
+\subsection*{Projektpfade}
+
+\begin{tabular}{ll}
+  \toprule
+  Komponente & Pfad \\
+  \midrule
+  Data-Projekt    & \texttt{C:\textbackslash Users\textbackslash Miebs\textbackslash PycharmProjects\textbackslash Data} \\
+  Research-Projekt & \texttt{C:\textbackslash Users\textbackslash Miebs\textbackslash PycharmProjects\textbackslash Research} \\
+  Datenbank       & PostgreSQL \texttt{research\_db} \\
+  Modul           & \texttt{modules/fetch\_usd\_rates.py} \\
+  \bottomrule
+\end{tabular}
+
+% ============================================================
+\section{Datenbankschema}
+
+\subsection{Tabellendefinition}
+
+\begin{lstlisting}[style=sql]
+CREATE SCHEMA IF NOT EXISTS pub_rates;
+
+CREATE TABLE IF NOT EXISTS pub_rates.usd_rates (
+    trade_date   DATE         NOT NULL,
+    tenor        VARCHAR(8)   NOT NULL,
+    tenor_days   SMALLINT     NOT NULL,
+    rate_type    VARCHAR(8)   NOT NULL,
+    rate_pct     NUMERIC(8,4),
+    compounding  VARCHAR(16)  NOT NULL,
+    source       VARCHAR(32)  NOT NULL,
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    PRIMARY KEY (trade_date, tenor, rate_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usd_rates_date
+    ON pub_rates.usd_rates (trade_date);
+\end{lstlisting}
+
+\subsection{Feldbeschreibung}
+
+\begin{tabular}{lll}
+  \toprule
+  Feld & Typ & Beschreibung \\
+  \midrule
+  \texttt{trade\_date}  & \texttt{DATE}        & Referenzdatum der Zinsbeobachtung \\
+  \texttt{tenor}        & \texttt{VARCHAR(8)}  & Lesbares Tenor-Label (z.\,B.\ \texttt{'3m'}, \texttt{'10y'}) \\
+  \texttt{tenor\_days}  & \texttt{SMALLINT}    & Tenor in Kalendertagen \\
+  \texttt{rate\_type}   & \texttt{VARCHAR(8)}  & \texttt{'par'} oder \texttt{'zero'} \\
+  \texttt{rate\_pct}    & \texttt{NUMERIC(8,4)}& Zinssatz in Prozent (z.\,B.\ $4{,}25$ für 4,25\,\%) \\
+  \texttt{compounding}  & \texttt{VARCHAR(16)} & Verzinsungskonvention (siehe \S\ref{sec:conventions}) \\
+  \texttt{source}       & \texttt{VARCHAR(32)} & \texttt{'FRED'} oder \texttt{'bootstrapped'} \\
+  \texttt{updated\_at}  & \texttt{TIMESTAMPTZ} & Zeitstempel des letzten Schreibvorgangs \\
+  \bottomrule
+\end{tabular}
+
+\subsection{Tenors und FRED-Serien}
+
+\begin{tabular}{lrrl}
+  \toprule
+  Tenor & Tage & FRED-Serie & Beschreibung \\
+  \midrule
+  \texttt{1m}  &    30 & \texttt{DGS1MO} & 1-Month Treasury CMT \\
+  \texttt{3m}  &    91 & \texttt{DGS3MO} & 3-Month Treasury CMT \\
+  \texttt{6m}  &   182 & \texttt{DGS6MO} & 6-Month Treasury CMT \\
+  \texttt{1y}  &   365 & \texttt{DGS1}   & 1-Year Treasury CMT \\
+  \texttt{2y}  &   730 & \texttt{DGS2}   & 2-Year Treasury CMT \\
+  \texttt{3y}  &  1095 & \texttt{DGS3}   & 3-Year Treasury CMT \\
+  \texttt{5y}  &  1825 & \texttt{DGS5}   & 5-Year Treasury CMT \\
+  \texttt{7y}  &  2555 & \texttt{DGS7}   & 7-Year Treasury CMT \\
+  \texttt{10y} &  3650 & \texttt{DGS10}  & 10-Year Treasury CMT \\
+  \texttt{20y} &  7300 & \texttt{DGS20}  & 20-Year Treasury CMT \\
+  \texttt{30y} & 10950 & \texttt{DGS30}  & 30-Year Treasury CMT \\
+  \bottomrule
+\end{tabular}
+
+% ============================================================
+\section{Zinssatzkonventionen}
+\label{sec:conventions}
+
+\subsection{Par-Yields (\texttt{rate\_type = 'par'})}
+
+Die FRED Constant Maturity Treasury (CMT) Rates werden unverändert
+gespeichert:
+
+\begin{itemize}
+  \item \textbf{Kurzläufer 1m, 3m, 6m}: Bank-Discount-Basis,
+        annualisiert auf Basis eines 360-Tage-Jahres.
+        \texttt{compounding = 'discount'}
+  \item \textbf{Langläufer 1y--30y}: Semiannuale Bond Equivalent Yield
+        (BEY). \texttt{compounding = 'semiannual'}
+\end{itemize}
+
+\subsection{Zero-Coupon-Rates (\texttt{rate\_type = 'zero'})}
+
+Werden per Bootstrap aus den Par-Yields abgeleitet.
+\texttt{compounding = 'annual'} für alle Zero-Rate-Zeilen.
+
+Diskontfaktor:
+\begin{equation}
+  \mathrm{disc}(\tau) = \left(1 + \frac{r_{\mathrm{zero}}}{100}\right)^{-\tau/365}
+  \label{eq:discfactor}
+\end{equation}
+
+Umrechnung in Application Code (diskret $\to$ kontinuierlich):
+\begin{equation}
+  r_{\mathrm{cont}} = \ln\!\left(1 + \frac{r_{\mathrm{disc}}}{100}\right)
+  \label{eq:disc2cont}
+\end{equation}
+
+% ============================================================
+\section{Bootstrap-Algorithmus}
+\label{sec:bootstrap}
+
+\subsection{Short-End: Bank-Discount zu Zero-Rate ($\leq 6$M)}
+
+T-Bill-Sätze liegen als Bank-Discount-Rate $d$ (in Prozent) vor.
+Umrechnung in jährlich diskrete Zero-Rate:
+
+\begin{align}
+  P &= 1 - \frac{d}{100} \cdot \frac{n}{360} \label{eq:tbill_price} \\[4pt]
+  r_{\mathrm{zero}} &= \left(\frac{1}{P}\right)^{365/n} - 1 \label{eq:tbill_zero}
+\end{align}
+
+wobei $n$ die Laufzeit in Kalendertagen ist.
+
+\subsection{Long-End: Sequentieller Bootstrap ($\geq 1$Y)}
+
+Treasury Bonds mit semiannualer Kuponzahlung und Nennwert 100.
+Par-Bonds handeln zum Kurs 100 (Kupon = Rendite).
+
+Die Par-Bond-Bedingung lautet:
+\begin{equation}
+  100 = \frac{c}{2} \cdot 100 \cdot \sum_{i=1}^{n-1} d(t_i)
+        + \left(1 + \frac{c}{2}\right) \cdot 100 \cdot d(T)
+  \label{eq:parbond}
+\end{equation}
+
+wobei:
+\begin{itemize}
+  \item $c$ die jährliche Kuponrate (als Dezimalzahl)
+  \item $t_i = i \cdot 0{,}5 \cdot 365$ Tage, $i = 1, \ldots, n{-}1$
+  \item $n = \mathrm{round}(T_{\mathrm{years}} \cdot 2)$ die Anzahl der semiannualen Perioden
+  \item $d(t_i)$ der Diskontfaktor aus bereits gebootstrappten Zero-Rates
+\end{itemize}
+
+Auflösen nach $d(T)$:
+\begin{equation}
+  d(T) = \frac{1 - \dfrac{c}{2} \displaystyle\sum_{i=1}^{n-1} d(t_i)}{1 + \dfrac{c}{2}}
+  \label{eq:solve_dT}
+\end{equation}
+
+Zero-Rate aus Diskontfaktor:
+\begin{equation}
+  r_{\mathrm{zero}}(T) = d(T)^{-365/T_{\mathrm{days}}} - 1
+  \label{eq:zero_from_d}
+\end{equation}
+
+\subsection{Interpolation von Zwischen-Cashflows}
+
+Zwischentermine $t_i$, die nicht exakt auf einen gebootstrappten Tenor
+fallen, werden log-linear interpoliert. Für $t_1 \leq t \leq t_2$:
+
+\begin{equation}
+  r(t) = (1-w)\,r(t_1) + w\,r(t_2),
+  \qquad
+  w = \frac{\ln t - \ln t_1}{\ln t_2 - \ln t_1}
+  \label{eq:loglin}
+\end{equation}
+
+An den Rändern (außerhalb des bekannten Bereichs) wird flach
+extrapoliert.
+
+\subsection{Bootstrap-Reihenfolge}
+
+Die Reihenfolge der Bootstrap-Schritte ist:
+
+\begin{enumerate}
+  \item \textbf{1m} --- Bank-Discount (Gl.~\ref{eq:tbill_price}--\ref{eq:tbill_zero})
+  \item \textbf{3m} --- Bank-Discount
+  \item \textbf{6m} --- Bank-Discount
+  \item \textbf{1y} --- Par-Bond Bootstrap; Zwischenterm 0,5y = exakter 6m-Zero
+  \item \textbf{2y} --- Par-Bond Bootstrap; 0,5y, 1,0y exakt; 1,5y interpoliert
+  \item \textbf{3y} --- Par-Bond Bootstrap; Zwischenterme aus 1y/2y-Zeros
+  \item \textbf{5y, 7y, 10y, 20y, 30y} --- analog
+\end{enumerate}
+
+% ============================================================
+\section{Implementierung}
+
+\subsection{Modulstruktur}
+
+\begin{tabular}{ll}
+  \toprule
+  Funktion & Aufgabe \\
+  \midrule
+  \texttt{\_ensure\_schema\_and\_table()} & Idempotente DDL-Ausführung beim Start \\
+  \texttt{\_get\_fetch\_start()}           & Inkrementelles Startdatum (MAX + 1 Tag) \\
+  \texttt{\_interp\_zero()}               & Log-lineare Interpolation der Zero-Kurve \\
+  \texttt{\_bill\_to\_zero()}             & Bank-Discount $\to$ annual discrete zero \\
+  \texttt{\_bond\_to\_zero()}             & Par-Bond-Bootstrap für einen Tenor \\
+  \texttt{\_bootstrap\_zeros()}           & Bootstrap für einen Handelstag (alle Tenors) \\
+  \texttt{\_build\_records()}             & Datenbankzeilen für Par + Zero \\
+  \texttt{run(snapshot\_date)}            & Haupteinstiegspunkt \\
+  \bottomrule
+\end{tabular}
+
+\subsection{Inkrementelles Laden}
+
+\begin{lstlisting}
+def _get_fetch_start() -> date:
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT MAX(trade_date) FROM pub_rates.usd_rates")
+        ).scalar()
+    if row is not None:
+        return row + timedelta(days=1)
+    return date.today().replace(year=date.today().year - 10)
+\end{lstlisting}
+
+Bei leerem Table: 10 Jahre Backfill ab heutigem Datum.
+Bei bestehendem Bestand: Start ab dem Tag nach dem letzten bekannten Handelstag.
+Wochenenden und US-Feiertage werden automatisch übersprungen
+(FRED liefert für diese Tage keine Beobachtungen).
+
+\subsection{Idempotenz}
+
+Schreibvorgänge nutzen \texttt{ON CONFLICT DO NOTHING} auf dem
+Primärschlüssel \texttt{(trade\_date, tenor, rate\_type)}. Ein
+wiederholter Lauf für denselben Zeitraum überschreibt keine Daten.
+
+% ============================================================
+\section{Verwendung in der SVIX-Pipeline}
+
+\subsection{Abfrage und Interpolation}
+
+Für einen Handelstag und eine Laufzeit $\tau$ (in Tagen) wird der
+risikofreie Zinssatz wie folgt ermittelt:
+
+\begin{lstlisting}
+def interpolate_zero_rate(trade_date, tau, conn):
+    rows = conn.execute(text("""
+        SELECT tenor_days, rate_pct
+        FROM pub_rates.usd_rates
+        WHERE trade_date = :d AND rate_type = 'zero'
+        ORDER BY tenor_days
+    """), {"d": trade_date}).fetchall()
+
+    days = [r[0] for r in rows]
+    rates = [r[1] for r in rows]
+
+    # log-linear interpolation (flat extrapolation at edges)
+    if tau <= days[0]:
+        return float(rates[0])
+    if tau >= days[-1]:
+        return float(rates[-1])
+    for i in range(len(days) - 1):
+        if days[i] <= tau <= days[i+1]:
+            w = (np.log(tau) - np.log(days[i])) / \
+                (np.log(days[i+1]) - np.log(days[i]))
+            return (1-w)*float(rates[i]) + w*float(rates[i+1])
+\end{lstlisting}
+
+\subsection{Diskontfaktor für den Binomialbaum}
+
+\begin{lstlisting}
+# 1. Zero-Rate interpolieren (in Prozent, annual discrete)
+r_zero_pct = interpolate_zero_rate(trade_date, tau, conn)
+
+# 2. Diskret -> kontinuierlich
+r_cont = np.log(1 + r_zero_pct / 100)
+
+# 3. Diskontfaktor
+disc = np.exp(-r_cont * tau / 365)
+\end{lstlisting}
+
+% ============================================================
+\section{Betrieb und Automatisierung}
+
+\subsection{Manueller Aufruf}
+
+\begin{lstlisting}[language=bash]
+cd C:\Users\Miebs\PycharmProjects\Data
+python -m modules.fetch_usd_rates
+\end{lstlisting}
+
+\subsection{Integration in run\_monthly.py}
+
+Das Modul ist als Schritt~5 in den monatlichen Pipeline-Orchestrator
+eingebunden:
+
+\begin{lstlisting}
+# Modul 5: USD Risk-Free Rates
+from modules.fetch_usd_rates import run as run_usd_rates
+run_usd_rates(snapshot_date)
+\end{lstlisting}
+
+\subsection{Windows Task Scheduler}
+
+Für die tägliche Aktualisierung ist ein separater Windows-Task
+eingerichtet:
+
+\begin{tabular}{ll}
+  \toprule
+  Parameter & Wert \\
+  \midrule
+  Task-Name          & \texttt{fetch\_usd\_rates} \\
+  Zeitplan           & täglich, 22:00 Uhr \\
+  Batch-Script       & \texttt{run\_usd\_rates.bat} \\
+  Log-Datei          & \texttt{logs/usd\_rates.log} \\
+  \texttt{StartWhenAvailable} & Ja (Nachholung bei abgeschaltetem PC) \\
+  \bottomrule
+\end{tabular}
+
+Die Uhrzeit 22:00 (MEZ/MESZ) stellt sicher, dass FRED die
+CMT-Rates bereits veröffentlicht hat (typisch: $\sim$21:30 MEZ,
+entspricht $\sim$15:30 ET).
+
+\subsection{Historischer Bestand (Stand: März 2026)}
+
+\begin{tabular}{lr}
+  \toprule
+  Kennzahl & Wert \\
+  \midrule
+  Erster Handelstag  & 22.03.2016 \\
+  Letzter Handelstag & 19.03.2026 \\
+  Anzahl Handelstage & 2.498 \\
+  Zeilen gesamt      & 54.956 \\
+  Zeilen pro Tag     & 22 (11 Par + 11 Zero) \\
+  \bottomrule
+\end{tabular}
+
+% ============================================================
+\begin{thebibliography}{9}
+\bibitem{martinwagner2019}
+  Martin, I. \& Wagner, C. (2019).
+  \textit{What is the Expected Return on a Stock?}
+  The Journal of Finance, 74(4), 1887--1929.
+\end{thebibliography}
+
+\end{document}

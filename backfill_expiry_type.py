@@ -14,12 +14,12 @@ with engine.begin() as con:
             oc.expiry_date,
             oc.snapshot_date,
             CASE
-                WHEN io.index_ric IS NOT NULL THEN 'index'
+                WHEN si.index_ric IS NOT NULL THEN 'index'
                 ELSE 'equity'
             END AS asset_type
         FROM pub_options.options_chains oc
-        LEFT JOIN pub_equity.index_overview io
-          ON io.index_ric = oc.underlying_ric
+        LEFT JOIN pub_config.stock_indices si
+          ON si.index_ric = oc.underlying_ric
         WHERE oc.expiry_type IS NULL
         ORDER BY oc.snapshot_date, oc.expiry_date
     """)).fetchall()
@@ -36,8 +36,8 @@ with engine.begin() as con:
               AND oc.expiry_type IS NULL
               AND (
                   CASE WHEN EXISTS (
-                      SELECT 1 FROM pub_equity.index_overview io
-                      WHERE io.index_ric = oc.underlying_ric
+                      SELECT 1 FROM pub_config.stock_indices io
+                      WHERE si.index_ric = oc.underlying_ric
                   ) THEN 'index' ELSE 'equity' END
               ) = :asset_type
         """), {

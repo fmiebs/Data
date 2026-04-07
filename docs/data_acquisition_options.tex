@@ -1,0 +1,326 @@
+\documentclass[12pt]{article}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{hyperref}
+\usepackage{setspace}
+\usepackage{microtype}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{siunitx}
+\sisetup{group-separator={,}, group-minimum-digits=4}
+
+\onehalfspacing
+
+\title{Data Acquisition for Equity Index Options:\\
+S\&P~500, Euro~Stoxx~50, S\&P/ASX~200, and Swiss Market Index}
+\author{}
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+
+\noindent
+This note describes in precise detail the construction of a historical panel of
+equity index option contracts and their associated price time series for four major
+index option markets: the S\&P~500 (SPX, CBOE), the Euro~Stoxx~50 (STOXX50E,
+Eurex), the S\&P/ASX~200 (AXJO, ASX), and the Swiss Market Index (SMI, Eurex).
+All data are sourced exclusively through the Refinitiv Eikon API,
+specifically the \texttt{ek.get\_data()} endpoint of the \texttt{eikon} Python
+package. No alternative retrieval methods---such as the \texttt{rd} library or
+\texttt{ek.get\_timeseries()}---are employed, as these offer a narrower set of
+historical fields and less reliable coverage of expired contracts. The Eikon
+Desktop application must be active on the local machine at the time of any data
+fetch, as the API communicates via a local proxy process (default port 9000).
+
+The overarching objective is to compile, for each index, the complete strip of
+monthly European-style options traded on or before a given reference date,
+together with their full bid--ask price history up to expiration. The data are
+stored in a PostgreSQL relational database under the schema \texttt{pub\_options},
+using two primary tables: \texttt{options\_chains}, which records contract-level
+metadata, and \texttt{options\_prices}, which records the daily bid and ask prices
+of each contract. The primary key of \texttt{options\_chains} is the pair
+(\texttt{underlying\_ric},~\texttt{option\_ric}), where \texttt{option\_ric}
+stores the Eikon base-form identifier of the contract, free of any leading slash
+or historical suffix. The primary key of \texttt{options\_prices} is
+(\texttt{option\_ric},~\texttt{price\_date}), where the \texttt{option\_ric}
+field in this table carries the historical identifier including the
+\texttt{\^{}} suffix described below.
+
+\bigskip
+
+\noindent\textbf{Instrument Identification and RIC Structure.}
+Each option contract in the Eikon system is uniquely identified by a Reuters
+Instrument Code (RIC). The structure of these codes differs substantially across
+exchanges, and a precise understanding of the encoding is essential for
+systematic retrieval. For the S\&P~500, the CBOE employs a
+date-embedded, strike-scaled format. A SPX option is identified as
+\texttt{SPX\{ltr\}\{DD\}\{YY\}\{K\}.U}, where \texttt{ltr} is a lowercase
+single character encoding both the option type and calendar month (a--l for
+January through December calls; m--x for January through December puts),
+\texttt{DD} is the two-digit expiration day, \texttt{YY} is the two-digit
+calendar year, \texttt{K} is the strike price multiplied by 10 and
+zero-padded to five digits, and \texttt{.U} denotes the CBOE venue. As a
+concrete example, the SPX February~2026 call at a strike of 6{,}900 is
+identified as \texttt{SPXb202669000.U}, in which \texttt{b} signals a February
+call, \texttt{20} is the expiration day, \texttt{26} encodes 2026, and
+\texttt{69000} encodes a strike of \$6{,}900.
+
+For the Euro~Stoxx~50, Eurex uses the format
+\texttt{STXE\{K{\times}10\}\{ltr\}\{y\}.EX}, where the strike is encoded as ten
+times the nominal strike value (so that a strike of 5{,}000 appears as
+\texttt{50000}), \texttt{ltr} is a single uppercase month letter (A for January
+through L for December for calls, M through X for puts), \texttt{y} is a
+single-digit calendar year, and \texttt{.EX} denotes the Eurex venue. A
+January~2026 Euro~Stoxx~50 call at strike 5{,}000 is thus encoded as
+\texttt{STXE50000A6.EX}. The SMI options traded on Eurex follow an analogous
+convention under the prefix \texttt{OSMI}, with the same strike multiplication
+by ten and single-digit year, using \texttt{.EX} as the venue suffix. A
+January~2026 SMI call at strike 12{,}000 appears as \texttt{OSMI120000A6.EX}.
+For the S\&P/ASX~200, the ASX exchange uses the format
+\texttt{AXJO\{K\}\{ltr\}\{y\}.AX}, where the strike is recorded at face value
+without any multiplication, \texttt{ltr} and \texttt{y} follow the same
+uppercase-letter and single-digit-year convention, and \texttt{.AX} is the
+venue suffix. An ASX~200 April~2026 put at strike 7{,}500 reads as
+\texttt{AXJO7500P6.AX}, with \texttt{P} denoting the April put letter.
+
+A structurally important feature of the single-digit year encoding used by
+Eurex and ASX is that the RIC for a given contract repeats every ten years.
+The identifier \texttt{STXE50000A6.EX} is syntactically identical for
+January~2016 and January~2026 contracts. Eikon resolves the ambiguity by
+serving data for the currently active cycle: as of April~2026, queries for
+\texttt{STXE50000A6.EX} return January~2026 data, not January~2016. For
+all historical price retrieval of expired contracts, Eikon instead requires a
+disambiguating suffix of the form \texttt{\^{}\{LETTER\}\{YY\}}, appended
+directly to the base RIC. The letter in the suffix is always the call-series
+month letter, regardless of whether the underlying contract is a call or a put,
+and \texttt{YY} is the full two-digit calendar year. Thus the historical
+identifier for a Euro~Stoxx~50 December~2025 put at strike 4{,}000 is
+\texttt{STXE40000X5.EX\^{}L25}, where the suffix \texttt{\^{}L25} uses
+\texttt{L} (the December call letter) and the two-digit year 25. The SPX,
+despite already encoding a two-digit year within its base RIC format, follows
+the same suffix convention for historical retrieval of expired contracts.
+The column \texttt{option\_ric\_hist} in \texttt{options\_chains} stores this
+historical identifier for every contract, and it is this column---not
+\texttt{option\_ric}---that is used as the join key to \texttt{options\_prices}.
+A live query against an active contract uses the format
+\texttt{/\{option\_ric\}} (with a leading slash), while historical time-series
+retrieval uses the \texttt{option\_ric\_hist} form without a leading slash.
+
+\bigskip
+
+\noindent\textbf{Monthly Expiry Convention and Expiry Classification.}
+European index options on the four markets expire on exchange-specific calendar
+dates. For SPX and the two Eurex products (Euro~Stoxx~50 and SMI), the standard
+monthly expiration is the third Friday of the calendar month, adjusted backward
+by one business day when that Friday coincides with a public holiday. Notable
+exceptions include Good Friday falling on the third Friday of April in 2019,
+2022, and 2025, in each of which the expiration shifted to the preceding
+Thursday. The ASX convention for the S\&P/ASX~200 differs: monthly expirations
+fall on the third Thursday of each month. Each contract in \texttt{options\_chains}
+is assigned an \texttt{expiry\_type} field taking one of three values: \texttt{M}
+(standard monthly), \texttt{W} (weekly, i.e.\ any expiration other than the
+canonical monthly date), or \texttt{L} (long-dated, defined as options with
+time to expiration exceeding one year at the time of the monthly pipeline
+snapshot, applicable to equity options only). The present dataset is
+restricted almost entirely to monthly expirations; weekly series account for
+less than one percent of contracts across all four indices and arise only
+because exchange chain queries occasionally return near-term weekly contracts
+listed alongside the regular monthly series.
+
+\bigskip
+
+\noindent\textbf{Strike Candidate Generation and Chain Construction.}
+The construction of the option strip proceeds through a systematic candidate
+generation step applied independently to each (index, expiry month) pair.
+For each target month, the index closing level on or immediately before the
+expiry date is retrieved from the \texttt{pub\_equity.index\_prices\_daily} table
+(with a fallback Eikon query covering the preceding seven calendar days).
+Candidate strikes are then generated as the arithmetic sequence of all
+multiples of five index points within a symmetric band of $\pm60\%$ around the
+observed index level, subject to a floor of one strike step. Concretely, for
+an index level $S$, the candidate set is
+\[
+  \mathcal{K} = \bigl\{\, k \in 5\mathbb{Z}^+ \colon
+  \lfloor 0.4S/5 \rfloor \cdot 5 \;\le\; k \;\le\;
+  \lceil 1.6S/5 \rceil \cdot 5 \,\bigr\},
+\]
+so that at the typical index levels observed over the sample period, each
+monthly expiry for SPX generates approximately 335 distinct strike levels on
+each of the call and put sides. The equivalent figures for Euro~Stoxx~50, SMI,
+and S\&P/ASX~200 are approximately 130, 82, and 110 strike levels per side,
+respectively, reflecting differences in index levels and the implied width of
+the $\pm60\%$ band in points.
+
+For each candidate (option type, strike, expiry) triple, an Eikon RIC is
+constructed according to the exchange-specific encoding described above.
+Contracts already present in the database are identified via a start-of-run
+query on \texttt{options\_chains} and excluded from the fetch. Remaining
+candidates are submitted to the Eikon \texttt{get\_data()} API in batches of 75
+RICs per call, querying the fields \texttt{TR.BIDPRICE.Date},
+\texttt{TR.BIDPRICE}, and \texttt{TR.ASKPRICE} over a lookback window of 18
+months ending on the expiry date. A contract is considered to exist and is
+written to \texttt{options\_chains} if and only if at least one non-null bid or
+ask observation is returned. Non-existing strike levels---which are numerous
+given the granularity of the five-point grid---simply return empty responses
+and are discarded. The batch sleep between successive API calls is set to 0.15
+seconds; upon encountering an HTTP~429 rate-limit error, the system suspends
+execution for 3{,}600 seconds and retries, with up to 24 retry attempts per
+batch, providing a theoretical maximum tolerance of 24 hours of sustained rate
+limiting before a batch is abandoned to a secondary retry queue. The retry
+queue is processed once the main pass is complete; only if a batch fails in
+the retry queue as well is it flagged as a permanent failure, at which point
+the recommended resume month is logged explicitly so that execution can be
+restarted at the precise point of interruption.
+
+\bigskip
+
+\noindent\textbf{Price Time Series Acquisition.}
+Once the chain metadata is populated in \texttt{options\_chains}, daily bid and
+ask prices are retrieved separately via the monthly pipeline module
+\texttt{fetch\_option\_prices}. For active (unexpired) contracts, the pipeline
+queries Eikon using the live RIC format (\texttt{/\{option\_ric\}}) and
+retrieves all available observations from the later of one year before the
+pipeline snapshot date or the maximum previously recorded price date for that
+contract. For expired contracts, the pipeline uses the historical
+\texttt{option\_ric\_hist} identifier, targeting a window beginning 12 months
+before the expiry date (or from the last recorded observation, if later).
+Expired and active contracts are submitted simultaneously in mixed batches to
+economise on API calls. Price records are written to \texttt{options\_prices}
+with the \texttt{option\_ric\_hist} as the primary key component, so that
+prices for both active and expired contracts share a unified, historically
+unambiguous identifier. The join between the two tables is always
+\texttt{options\_chains.option\_ric\_hist = options\_prices.option\_ric}.
+A completeness flag (\texttt{bid\_complete}, \texttt{ask\_complete}) is
+set to \texttt{TRUE} in \texttt{options\_chains} if at least one price
+observation exists within 30 calendar days before the contract's expiry date,
+providing a rapid diagnostic for data coverage.
+
+\bigskip
+
+\noindent\textbf{Descriptive Statistics.}
+Table~\ref{tab:desc} summarises the composition of the option panel as of
+1 April 2026. The sample spans a common window of January 2016 through March
+2026 for monthly expirations, though additional long-dated SPX and Euro~Stoxx~50
+expirations extend the chain metadata to December 2031 and December 2035,
+respectively, reflecting contracts already listed on the exchanges at the time
+of the most recent snapshot.
+
+The SPX constitutes the largest subpanel with 93{,}513 individual option
+records across 142 distinct expiry dates. The strike grid covers the range
+from \$200 to \$16{,}000, encompassing 1{,}336 unique strike levels in total
+across the full sample period, with an average of 334.7 strikes per monthly
+expiry (median 345). The large variation in the per-expiry count---from a
+minimum of 32 strikes to a maximum of 520---reflects the pronounced
+time-variation in the index level over the decade-long sample, which spans the
+COVID-19 drawdown of early 2020, the subsequent recovery, and the sustained
+rally through 2024--2025. The price panel for SPX comprises 13{,}262{,}266
+daily bid--ask records drawn from 92{,}583 distinct contracts, equivalent to
+a coverage rate of 99.0\% of all catalogued SPX options. The average bid price
+across all non-zero daily observations is \$502.77 (median \$191.60), and the
+average bid--ask spread is \$6.62.
+
+The Euro~Stoxx~50 panel contains 38{,}659 option records across 150 expiry
+dates, with strikes ranging from 100 to 18{,}000 index points. The average
+number of distinct strike levels per monthly expiry is 130.1 (median 120),
+reflecting the somewhat lower nominal index level relative to the $\pm60\%$
+band width in absolute terms. The price panel encompasses 4{,}639{,}489
+daily observations from 35{,}263 distinct contracts (coverage rate of
+91.2\%). The average bid is \EUR{}435.18 with a median of \EUR{}180.10 and an
+average bid--ask spread of \EUR{}13.34. The wider proportional spread relative
+to SPX is consistent with the lower liquidity of Eurex-traded Euro~Stoxx~50
+options at extreme strikes.
+
+For the S\&P/ASX~200, the panel spans 131 monthly expiry dates and records
+25{,}730 option contracts over strikes from A\$2{,}500 to A\$16{,}500.
+Unlike the other three indices, no weekly or long-dated contracts appear in
+the dataset, consistent with the ASX product structure that offers only
+standard monthly expirations for index options. The average strike count
+per monthly expiry is 109.8 (median 107). Price coverage is high at 94.7\%,
+with 2{,}480{,}058 daily price records from 24{,}371 distinct contracts.
+The average bid price is A\$395.18 (median A\$226.00) and the average
+bid--ask spread is A\$38.85, substantially wider in nominal terms than the
+SPX and Euro~Stoxx~50, which partly reflects the index's higher absolute
+strike level relative to option premia and the market's lower depth.
+
+The SMI panel contains 20{,}638 option records across 139 expiry dates,
+with strikes ranging from CHF~3{,}500 to CHF~20{,}000 and an average of
+82.0 strike levels per monthly expiry (median 81), the most concentrated
+distribution of the four indices. The price panel covers 2{,}378{,}843
+daily observations from 19{,}893 contracts (coverage rate of 96.4\%).
+Average bid and ask prices are CHF~735.0 and CHF~774.0, respectively,
+reflecting the high nominal index level; the median bid is CHF~377.3.
+The average bid--ask spread of CHF~39.3 is comparable in magnitude to
+the ASX~200.
+
+The aggregate price panel across all four indices totals 22{,}760{,}656
+daily bid--ask observations, providing a longitudinal record of option
+pricing that is dense enough to support high-frequency cross-sectional
+analyses of the volatility surface as well as time-series estimation
+of model-free variance measures such as the synthetic volatility index
+(SVIX) of \citet{martin2017} and its equity-level generalisation.
+
+\begin{table}[ht]
+\centering
+\caption{Descriptive statistics of the option panel as of 1 April 2026.
+``Contracts'' denotes the number of distinct (underlying, option RIC) pairs
+in \texttt{options\_chains}. ``Expiries'' counts distinct expiry dates.
+``Strikes per expiry'' refers to monthly expirations only.
+``Price rows'' is the total number of daily bid--ask records in
+\texttt{options\_prices}. Prices are denominated in the respective index
+currency (USD for SPX; EUR for Euro~Stoxx~50; AUD for S\&P/ASX~200;
+CHF for SMI). Spreads and price levels are computed over non-zero bid
+observations.}
+\label{tab:desc}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+ & \textbf{SPX} & \textbf{Euro Stoxx 50} & \textbf{S\&P/ASX 200} & \textbf{SMI} \\
+\midrule
+Exchange & CBOE & Eurex & ASX & Eurex \\
+Currency & USD & EUR & AUD & CHF \\
+Expiry convention & 3rd Fri & 3rd Fri & 3rd Thu & 3rd Fri \\
+Strike step (pts) & 5 & 5 & 5 & 5 \\
+Strike range (\%) & $\pm60$ & $\pm60$ & $\pm60$ & $\pm60$ \\
+\midrule
+Contracts & 93{,}513 & 38{,}659 & 25{,}730 & 20{,}638 \\
+\quad of which calls & 46{,}749 & 19{,}332 & 12{,}203 & 10{,}374 \\
+\quad of which puts & 46{,}764 & 19{,}327 & 13{,}527 & 10{,}264 \\
+\quad of which monthly & 93{,}093 & 38{,}393 & 25{,}730 & 20{,}452 \\
+\quad of which weekly & 420 & 266 & 0 & 186 \\
+Distinct expiry dates & 142 & 150 & 131 & 139 \\
+First expiry & Jan 2016 & Jan 2016 & Jan 2016 & Jan 2016 \\
+Last expiry (metadata) & Dec 2031 & Dec 2035 & Sep 2027 & Dec 2030 \\
+Unique strike levels & 1{,}336 & 603 & 314 & 234 \\
+Strike range & 200--16{,}000 & 100--18{,}000 & 2{,}500--16{,}500 & 3{,}500--20{,}000 \\
+\midrule
+Avg.\ strikes / monthly expiry & 334.7 & 130.1 & 109.8 & 82.0 \\
+Median strikes / monthly expiry & 345 & 120 & 107 & 81 \\
+Min.\ strikes / monthly expiry & 32 & 13 & 27 & 12 \\
+Max.\ strikes / monthly expiry & 520 & 322 & 163 & 145 \\
+\midrule
+Price rows (total) & 13{,}262{,}266 & 4{,}639{,}489 & 2{,}480{,}058 & 2{,}378{,}843 \\
+Price coverage (\%) & 99.0 & 91.2 & 94.7 & 96.4 \\
+Price sample start & Jul 2014 & Dec 2014 & Feb 2015 & Dec 2014 \\
+Price sample end & Apr 2026 & Apr 2026 & Apr 2026 & Apr 2026 \\
+Rows with bid & 12{,}016{,}139 & 4{,}344{,}340 & 2{,}215{,}980 & 2{,}210{,}350 \\
+Rows with ask & 12{,}016{,}993 & 4{,}355{,}703 & 2{,}237{,}517 & 2{,}213{,}674 \\
+Avg.\ bid price & 502.77 & 435.18 & 395.18 & 735.0 \\
+Median bid price & 191.60 & 180.10 & 226.00 & 377.3 \\
+Avg.\ bid--ask spread & 6.62 & 13.34 & 38.85 & 39.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{1}
+\bibitem{martin2017}
+Martin, I. (2017).
+\newblock What is the expected return on the market?
+\newblock \textit{The Quarterly Journal of Economics}, 132(1):367--433.
+\end{thebibliography}
+
+\end{document}

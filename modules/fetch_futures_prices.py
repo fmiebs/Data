@@ -2,13 +2,14 @@
 fetch_futures_prices.py
 -----------------------
 Fetches daily bid/ask/settle/volume/open-interest for all futures contracts
-in pub_futures.futures_chains and writes them to pub_futures.futures_prices.
+in pub_futures.futures_chains. Writes to pub_futures.futures_prices.
 
 Delta logic per futures_ric:
-  - No existing rows  → start_date = today - 1 year
-  - Existing rows     → start_date = MAX(price_date) + 1 day
-  - start_date > today → skip
+  - No existing rows  -> start_date = today - 1 year
+  - Existing rows     -> start_date = MAX(price_date) + 1 day
+  - start_date > today -> skip
 """
+import logging
 import time
 from collections import defaultdict
 from datetime import date, timedelta
@@ -18,13 +19,18 @@ import pandas as pd
 from sqlalchemy import text, Table, MetaData
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from config.db import engine
 from config import eikon_init  # noqa: F401
+from config.db import engine
+from config.logging_setup import setup_logging
+from config.pipeline import run_finish, run_start
+from modules.utils import eikon_fetch
 
 SCHEMA     = 'pub_futures'
 TABLE      = 'futures_prices'
 SLEEP_TIME = 0.5
 BATCH_SIZE = 50
+
+logger = setup_logging('fetch_futures_prices')
 
 _prices_table = None
 
@@ -36,44 +42,32 @@ def _get_prices_table():
     return _prices_table
 
 
-def _get_start_date(conn, futures_ric: str) -> date | None:
+def _get_start_date(conn, futures_ric: str,
+                    override_start: date | None = None) -> date | None:
+    if override_start is not None:
+        return override_start
     row = conn.execute(
-        text(f"SELECT MAX(price_date) FROM {SCHEMA}.{TABLE} "
-             "WHERE futures_ric = :ric"),
-        {"ric": futures_ric}
+        text(f"SELECT MAX(price_date) FROM {SCHEMA}.{TABLE} WHERE futures_ric = :ric"),
+        {'ric': futures_ric}
     ).scalar()
-
     today = date.today()
-    if row is None:
-        start = today.replace(year=today.year - 1)
-    else:
-        start = row + timedelta(days=1)
+    start = (today.replace(year=today.year - 1) if row is None
+             else row + timedelta(days=1))
+    return None if start > today else start
 
-    if start > today:
+
+def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFrame | None:
+    result = eikon_fetch(
+        ek.get_data,
+        rics,
+        ['TR.BIDPRICE.Date', 'TR.BIDPRICE', 'TR.ASKPRICE',
+         'TR.SettlePrice', 'TR.Volume', 'TR.OpenInterest'],
+        {'SDate': start_date.strftime('%Y-%m-%d'),
+         'EDate': end_date.strftime('%Y-%m-%d')},
+    )
+    if result is None:
         return None
-    return start
-
-
-def _fetch_batch(rics: list[str], start_date: date, end_date: date,
-                 _retries: int = 0) -> pd.DataFrame | None:
-    try:
-        data, err = ek.get_data(
-            rics,
-            ['TR.BIDPRICE.Date', 'TR.BIDPRICE', 'TR.ASKPRICE',
-             'TR.SettlePrice', 'TR.Volume', 'TR.OpenInterest'],
-            {'SDate': start_date.strftime('%Y-%m-%d'),
-             'EDate': end_date.strftime('%Y-%m-%d')}
-        )
-    except Exception as e:
-        if '429' in str(e) or 'limit' in str(e).lower():
-            if _retries >= 5:
-                print(f"  ERROR batch {rics[0]} – max retries, skipping")
-                return None
-            print(f"  Rate limit – waiting 63s (attempt {_retries + 1}/5)...")
-            time.sleep(63)
-            return _fetch_batch(rics, start_date, end_date, _retries + 1)
-        print(f"  ERROR batch {rics[0]}: {e}")
-        return None
+    data, _ = result
 
     if data is None or data.empty:
         return None
@@ -85,58 +79,56 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date,
         None
     )
     if date_col is None:
-        print(f"  WARN: no date column (cols: {list(data.columns)}) – skipping")
+        logger.warning('No date column (cols: %s)', list(data.columns))
         return None
 
-    col_map = {
-        'Instrument':    'futures_ric',
-        date_col:        'price_date',
-        'Bid Price':     'price_bid',
-        'Ask Price':     'price_ask',
+    df = data.rename(columns={
+        'Instrument':       'futures_ric',
+        date_col:           'price_date',
+        'Bid Price':        'price_bid',
+        'Ask Price':        'price_ask',
         'Settlement Price': 'price_settle',
-        'Volume':        'volume',
-        'Open Interest': 'open_interest',
-    }
-    df = data.rename(columns=col_map)
+        'Volume':           'volume',
+        'Open Interest':    'open_interest',
+    })
 
     if 'futures_ric' not in df.columns:
-        print(f"  WARN: 'Instrument' absent (cols: {list(data.columns)}) – skipping")
+        logger.warning("'Instrument' absent (cols: %s)", list(data.columns))
         return None
 
     df['price_date'] = pd.to_datetime(df['price_date']).dt.date
     df = df.dropna(subset=['price_date'])
 
-    for col in ('price_bid', 'price_ask', 'price_settle'):
+    for col in ('price_bid', 'price_ask', 'price_settle', 'volume', 'open_interest'):
         if col not in df.columns:
             df[col] = None
         else:
             df[col] = df[col].where(df[col].notna(), other=None)
 
-    for col in ('volume', 'open_interest'):
-        if col not in df.columns:
-            df[col] = None
-        else:
-            df[col] = df[col].where(df[col].notna(), other=None)
-
-    valid_cols = ['futures_ric', 'price_date', 'price_bid', 'price_ask',
-                  'price_settle', 'volume', 'open_interest']
-    return df[valid_cols]
+    return df[['futures_ric', 'price_date', 'price_bid', 'price_ask',
+               'price_settle', 'volume', 'open_interest']]
 
 
-def run(snapshot_date: str | None = None) -> None:
-    end_date = date.today()
+def run(
+    snapshot_date: str | None = None,  # noqa: ARG001
+    mode: str = 'live',
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> None:
+    end      = date.fromisoformat(end_date) if end_date else date.today()
+    override = date.fromisoformat(start_date) if (mode == 'backfill' and start_date) else None
 
-    print(f"fetch_futures_prices | end_date={end_date}")
+    logger.info('fetch_futures_prices | mode=%s | end_date=%s', mode, end)
+    run_id = run_start('fetch_futures_prices', mode, snapshot_date)
 
-    # Universe: all distinct futures_ric from the latest snapshot per underlying
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
                 SELECT DISTINCT fc.futures_ric
                 FROM pub_futures.futures_chains fc
-                JOIN pub_futures.futures_overview fo
-                  ON fo.underlying_ric = fc.underlying_ric
-                WHERE fo.active = TRUE
+                JOIN pub_config.futures_underlyings fu
+                  ON fu.underlying_ric = fc.underlying_ric
+                WHERE fu.active = TRUE
                   AND fc.snapshot_date = (
                       SELECT MAX(snapshot_date)
                       FROM pub_futures.futures_chains fc2
@@ -146,55 +138,60 @@ def run(snapshot_date: str | None = None) -> None:
         ).fetchall()
 
     all_rics = [r[0] for r in rows]
-    print(f"  {len(all_rics)} futures RICs in scope")
+    logger.info('%d futures RICs in scope', len(all_rics))
 
     if not all_rics:
-        print("  Nothing to fetch – run fetch_futures_chains first.")
+        logger.warning('Nothing to fetch – run fetch_futures_chains first.')
+        run_finish(run_id, rows_written=0)
         return
 
-    # Delta logic: group by start_date for efficient batching
     groups: dict[date, list[str]] = defaultdict(list)
     with engine.connect() as conn:
         for ric in all_rics:
-            start = _get_start_date(conn, ric)
-            if start is not None:
-                groups[start].append(ric)
+            s = _get_start_date(conn, ric, override)
+            if s is not None:
+                groups[s].append(ric)
 
-    print(f"  {sum(len(v) for v in groups.values())} RICs to fetch "
-          f"across {len(groups)} start-date group(s)")
+    logger.info('%d RICs to fetch across %d start-date group(s)',
+                sum(len(v) for v in groups.values()), len(groups))
 
-    tbl = _get_prices_table()
+    tbl           = _get_prices_table()
     total_written = 0
 
-    for start_date, rics in sorted(groups.items()):
-        print(f"  Group start_date={start_date} | {len(rics)} RICs")
-        for i in range(0, len(rics), BATCH_SIZE):
-            batch = rics[i:i + BATCH_SIZE]
-            df = _fetch_batch(batch, start_date, end_date)
+    try:
+        for s_date, rics in sorted(groups.items()):
+            logger.info('Group start_date=%s | %d RICs', s_date, len(rics))
+            for i in range(0, len(rics), BATCH_SIZE):
+                batch = rics[i:i + BATCH_SIZE]
+                df    = _fetch_batch(batch, s_date, end)
 
-            if df is not None and not df.empty:
-                df = df.drop_duplicates(subset=['futures_ric', 'price_date'])
-                records = df.to_dict(orient='records')
-                stmt = pg_insert(tbl).values(records).on_conflict_do_update(
-                    index_elements=['futures_ric', 'price_date'],
-                    set_={
-                        'price_bid':     pg_insert(tbl).excluded.price_bid,
-                        'price_ask':     pg_insert(tbl).excluded.price_ask,
-                        'price_settle':  pg_insert(tbl).excluded.price_settle,
-                        'volume':        pg_insert(tbl).excluded.volume,
-                        'open_interest': pg_insert(tbl).excluded.open_interest,
-                    }
-                )
-                with engine.begin() as conn:
-                    conn.execute(stmt)
-                total_written += len(df)
-                print(f"    batch {i // BATCH_SIZE + 1}: {len(df)} rows written")
-            else:
-                print(f"    batch {i // BATCH_SIZE + 1}: no data")
+                if df is not None and not df.empty:
+                    df = df.drop_duplicates(subset=['futures_ric', 'price_date'])
+                    records = df.to_dict(orient='records')
+                    stmt = pg_insert(tbl).values(records).on_conflict_do_update(
+                        index_elements=['futures_ric', 'price_date'],
+                        set_={
+                            'price_bid':     pg_insert(tbl).excluded.price_bid,
+                            'price_ask':     pg_insert(tbl).excluded.price_ask,
+                            'price_settle':  pg_insert(tbl).excluded.price_settle,
+                            'volume':        pg_insert(tbl).excluded.volume,
+                            'open_interest': pg_insert(tbl).excluded.open_interest,
+                        }
+                    )
+                    with engine.begin() as conn:
+                        conn.execute(stmt)
+                    total_written += len(df)
+                    logger.info('  batch %d: %d rows written', i // BATCH_SIZE + 1, len(df))
+                else:
+                    logger.info('  batch %d: no data', i // BATCH_SIZE + 1)
 
-            time.sleep(SLEEP_TIME)
+                time.sleep(SLEEP_TIME)
 
-    print(f"fetch_futures_prices done. Total rows written: {total_written}")
+        run_finish(run_id, rows_written=total_written)
+        logger.info('fetch_futures_prices done. rows_written=%d', total_written)
+    except Exception as e:
+        run_finish(run_id, error=str(e))
+        raise
 
 
 if __name__ == '__main__':

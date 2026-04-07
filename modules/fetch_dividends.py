@@ -1,21 +1,15 @@
 """
 fetch_dividends.py
 ------------------
-Fetches regular and special cash dividends for all SPX constituents
-from Refinitiv Eikon and writes them to pub_equity.dividends.
-
-Two separate pulls per RIC:
-  1. Regular dividends:  TR.DivExDate + TR.DivUnadjustedGross (+ TR.DivPayDate)
-  2. Special dividends:  TR.SpecialDivExDate + TR.SpecialDivAmount
+Fetches regular and special cash dividends for all SPX constituents.
+Writes to pub_equity.stock_dividends.
 
 Delta logic per RIC and div_type:
-  - No existing rows  → start_date = today - 10 years
-  - Existing rows     → start_date = MAX(ex_date) + 1 day
-  - start_date > today → skip
-
-Upsert on PK (ric, ex_date, div_type) — on conflict do nothing
-(dividend amounts are historical facts; we don't overwrite).
+  - No existing rows  -> start_date = today - HISTORY_YEARS
+  - Existing rows     -> start_date = MAX(ex_date) + 1 day
+  - start_date > today -> skip
 """
+import logging
 import time
 from datetime import date, timedelta
 
@@ -24,14 +18,19 @@ import pandas as pd
 from sqlalchemy import text, Table, MetaData
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from config.db import engine
 from config import eikon_init  # noqa: F401
+from config.db import engine
+from config.logging_setup import setup_logging
+from config.pipeline import run_finish, run_start
+from modules.utils import eikon_fetch
 
-SCHEMA = 'pub_equity'
-TABLE = 'dividends'
-SLEEP_TIME = 0.5
-BATCH_SIZE = 20
+SCHEMA        = 'pub_equity'
+TABLE         = 'stock_dividends'
+SLEEP_TIME    = 0.5
+BATCH_SIZE    = 20
 HISTORY_YEARS = 10
+
+logger = setup_logging('fetch_dividends')
 
 _div_table = None
 
@@ -43,70 +42,48 @@ def _get_div_table():
     return _div_table
 
 
-def _get_start_date(conn, ric: str, div_type: str) -> date | None:
+def _get_start_date(conn, ric: str, div_type: str,
+                    override_start: date | None = None) -> date | None:
+    if override_start is not None:
+        return override_start
     row = conn.execute(
-        text(
-            f"SELECT MAX(ex_date) FROM {SCHEMA}.{TABLE} "
-            "WHERE ric = :ric AND div_type = :div_type"
-        ),
-        {"ric": ric, "div_type": div_type}
+        text(f"SELECT MAX(ex_date) FROM {SCHEMA}.{TABLE} "
+             "WHERE ric = :ric AND div_type = :div_type"),
+        {'ric': ric, 'div_type': div_type}
     ).scalar()
-
     today = date.today()
-    if row is None:
-        start = today.replace(year=today.year - HISTORY_YEARS)
-    else:
-        start = row + timedelta(days=1)
+    start = (today.replace(year=today.year - HISTORY_YEARS) if row is None
+             else row + timedelta(days=1))
+    return None if start > today else start
 
-    if start > today:
+
+def _fetch_regular(rics: list[str], start_date: date, end_date: date) -> pd.DataFrame | None:
+    result = eikon_fetch(
+        ek.get_data,
+        rics,
+        ['TR.DivExDate', 'TR.DivUnadjustedGross', 'TR.DivPayDate', 'TR.DivCurrency'],
+        {'SDate': start_date.strftime('%Y-%m-%d'), 'EDate': end_date.strftime('%Y-%m-%d')},
+    )
+    if result is None:
         return None
-    return start
-
-
-def _fetch_regular(rics: list[str], start_date: date, end_date: date,
-                   _retries: int = 0) -> pd.DataFrame | None:
-    """Fetch regular cash dividends."""
-    try:
-        data, err = ek.get_data(
-            rics,
-            [
-                'TR.DivExDate',
-                'TR.DivUnadjustedGross',
-                'TR.DivPayDate',
-                'TR.DivCurrency',
-            ],
-            {
-                'SDate': start_date.strftime('%Y-%m-%d'),
-                'EDate': end_date.strftime('%Y-%m-%d'),
-            }
-        )
-    except Exception as e:
-        if '429' in str(e) or 'limit' in str(e).lower():
-            if _retries >= 5:
-                print(f"  ERROR regular batch {rics[0]} – max retries, skipping")
-                return None
-            print(f"  Rate limit – waiting 63s (attempt {_retries + 1}/5)...")
-            time.sleep(63)
-            return _fetch_regular(rics, start_date, end_date, _retries + 1)
-        print(f"  ERROR regular batch {rics[0]}: {e}")
-        return None
+    data, _ = result
 
     if data is None or data.empty:
         return None
 
     col_map = {
-        'Instrument':               'ric',
-        'Dividend Ex Date':         'ex_date',
-        'Ex-Dividend Date':         'ex_date',   # fallback alias
-        'Gross Dividend Amount':    'amount',
-        'Dividend Pay Date':        'pay_date',
-        'Pay Date':                 'pay_date',  # fallback alias
-        'Dividend Currency':        'currency',
+        'Instrument':            'ric',
+        'Dividend Ex Date':      'ex_date',
+        'Ex-Dividend Date':      'ex_date',
+        'Gross Dividend Amount': 'amount',
+        'Dividend Pay Date':     'pay_date',
+        'Pay Date':              'pay_date',
+        'Dividend Currency':     'currency',
     }
     df = data.rename(columns=col_map)
 
     if 'ric' not in df.columns or 'ex_date' not in df.columns:
-        print(f"  WARN: expected columns missing (cols: {list(data.columns)}) – skipping")
+        logger.warning('Expected columns missing (cols: %s)', list(data.columns))
         return None
 
     df['ex_date'] = pd.to_datetime(df['ex_date'], errors='coerce').dt.date
@@ -127,41 +104,23 @@ def _fetch_regular(rics: list[str], start_date: date, end_date: date,
     else:
         df['currency'] = df['currency'].where(df['currency'].notna(), other=None)
 
-    valid_cols = ['ric', 'ex_date', 'div_type', 'amount', 'currency', 'pay_date']
-    return df[valid_cols]
+    return df[['ric', 'ex_date', 'div_type', 'amount', 'currency', 'pay_date']]
 
 
-def _fetch_special(rics: list[str], start_date: date, end_date: date,
-                   _retries: int = 0) -> pd.DataFrame | None:
-    """Fetch special (non-recurring) cash dividends."""
-    try:
-        data, err = ek.get_data(
-            rics,
-            [
-                'TR.SpecialDivExDate',
-                'TR.SpecialDivAmount',
-                'TR.SpecialDivCurrency',
-            ],
-            {
-                'SDate': start_date.strftime('%Y-%m-%d'),
-                'EDate': end_date.strftime('%Y-%m-%d'),
-            }
-        )
-    except Exception as e:
-        if '429' in str(e) or 'limit' in str(e).lower():
-            if _retries >= 5:
-                print(f"  ERROR special batch {rics[0]} – max retries, skipping")
-                return None
-            print(f"  Rate limit – waiting 63s (attempt {_retries + 1}/5)...")
-            time.sleep(63)
-            return _fetch_special(rics, start_date, end_date, _retries + 1)
-        print(f"  ERROR special batch {rics[0]}: {e}")
+def _fetch_special(rics: list[str], start_date: date, end_date: date) -> pd.DataFrame | None:
+    result = eikon_fetch(
+        ek.get_data,
+        rics,
+        ['TR.SpecialDivExDate', 'TR.SpecialDivAmount', 'TR.SpecialDivCurrency'],
+        {'SDate': start_date.strftime('%Y-%m-%d'), 'EDate': end_date.strftime('%Y-%m-%d')},
+    )
+    if result is None:
         return None
+    data, _ = result
 
     if data is None or data.empty:
         return None
 
-    # Eikon may return uppercase field names (e.g. TR.SPECIALDIVEXDATE) when data is sparse
     def _find_col(df_cols, *patterns) -> str | None:
         for pat in patterns:
             for c in df_cols:
@@ -198,15 +157,14 @@ def _fetch_special(rics: list[str], start_date: date, end_date: date,
     else:
         df['currency'] = df['currency'].where(df['currency'].notna(), other=None)
 
-    valid_cols = ['ric', 'ex_date', 'div_type', 'amount', 'currency', 'pay_date']
-    return df[valid_cols]
+    return df[['ric', 'ex_date', 'div_type', 'amount', 'currency', 'pay_date']]
 
 
 def _write_records(df: pd.DataFrame) -> int:
-    tbl = _get_div_table()
-    df = df.drop_duplicates(subset=['ric', 'ex_date', 'div_type'])
+    tbl     = _get_div_table()
+    df      = df.drop_duplicates(subset=['ric', 'ex_date', 'div_type'])
     records = df.to_dict(orient='records')
-    stmt = pg_insert(tbl).values(records).on_conflict_do_nothing(
+    stmt    = pg_insert(tbl).values(records).on_conflict_do_nothing(
         index_elements=['ric', 'ex_date', 'div_type']
     )
     with engine.begin() as conn:
@@ -214,74 +172,77 @@ def _write_records(df: pd.DataFrame) -> int:
     return len(df)
 
 
-def run(snapshot_date: str | None = None) -> None:  # noqa: ARG001
-    end_date = date.today()
+def run(
+    snapshot_date: str | None = None,  # noqa: ARG001
+    mode: str = 'live',
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> None:
+    end      = date.fromisoformat(end_date) if end_date else date.today()
+    override = date.fromisoformat(start_date) if (mode == 'backfill' and start_date) else None
 
-    print(f"fetch_dividends | end_date={end_date} | history={HISTORY_YEARS}y")
+    logger.info('fetch_dividends | mode=%s | end_date=%s', mode, end)
+    run_id = run_start('fetch_dividends', mode, snapshot_date)
 
     with engine.connect() as conn:
         rows = conn.execute(
-            text(
-                "SELECT DISTINCT constituent_ric "
-                "FROM pub_equity.index_constituents "
-                "WHERE index_ric = '.SPX'"
-            )
+            text("SELECT DISTINCT constituent_ric "
+                 "FROM pub_equity.index_constituents WHERE index_ric = '.SPX'")
         ).fetchall()
 
     all_rics = [r[0] for r in rows]
-    print(f"  {len(all_rics)} RICs in universe")
+    logger.info('%d RICs in universe', len(all_rics))
 
-    # Determine start dates for regular and special separately
     regular_starts: dict[str, date] = {}
     special_starts: dict[str, date] = {}
 
     with engine.connect() as conn:
         for ric in all_rics:
-            s_reg = _get_start_date(conn, ric, 'regular')
+            s_reg = _get_start_date(conn, ric, 'regular', override)
             if s_reg is not None:
                 regular_starts[ric] = s_reg
-            s_spe = _get_start_date(conn, ric, 'special')
+            s_spe = _get_start_date(conn, ric, 'special', override)
             if s_spe is not None:
                 special_starts[ric] = s_spe
 
-    print(f"  {len(regular_starts)} RICs to fetch (regular), "
-          f"{len(special_starts)} RICs to fetch (special)")
+    logger.info('%d RICs (regular), %d RICs (special)',
+                len(regular_starts), len(special_starts))
 
     total_written = 0
+    try:
+        for i in range(0, len(regular_starts), BATCH_SIZE):
+            batch_rics  = list(regular_starts.keys())[i:i + BATCH_SIZE]
+            batch_start = min(regular_starts[r] for r in batch_rics)
+            df = _fetch_regular(batch_rics, batch_start, end)
+            if df is not None and not df.empty:
+                n = _write_records(df)
+                total_written += n
+                logger.info('regular batch %d: %d rows (%s...)',
+                            i // BATCH_SIZE + 1, n, batch_rics[0])
+            else:
+                logger.info('regular batch %d: no data (%s...)',
+                            i // BATCH_SIZE + 1, batch_rics[0])
+            time.sleep(SLEEP_TIME)
 
-    # --- Regular dividends ---
-    rics_reg = list(regular_starts.keys())
-    for i in range(0, len(rics_reg), BATCH_SIZE):
-        batch_rics = rics_reg[i:i + BATCH_SIZE]
-        batch_start = min(regular_starts[r] for r in batch_rics)
+        for i in range(0, len(special_starts), BATCH_SIZE):
+            batch_rics  = list(special_starts.keys())[i:i + BATCH_SIZE]
+            batch_start = min(special_starts[r] for r in batch_rics)
+            df = _fetch_special(batch_rics, batch_start, end)
+            if df is not None and not df.empty:
+                n = _write_records(df)
+                total_written += n
+                logger.info('special batch %d: %d rows (%s...)',
+                            i // BATCH_SIZE + 1, n, batch_rics[0])
+            else:
+                logger.info('special batch %d: no data (%s...)',
+                            i // BATCH_SIZE + 1, batch_rics[0])
+            time.sleep(SLEEP_TIME)
 
-        df = _fetch_regular(batch_rics, batch_start, end_date)
-        if df is not None and not df.empty:
-            n = _write_records(df)
-            total_written += n
-            print(f"    regular batch {i // BATCH_SIZE + 1}: {n} rows ({batch_rics[0]}…)")
-        else:
-            print(f"    regular batch {i // BATCH_SIZE + 1}: no data ({batch_rics[0]}…)")
-
-        time.sleep(SLEEP_TIME)
-
-    # --- Special dividends ---
-    rics_spe = list(special_starts.keys())
-    for i in range(0, len(rics_spe), BATCH_SIZE):
-        batch_rics = rics_spe[i:i + BATCH_SIZE]
-        batch_start = min(special_starts[r] for r in batch_rics)
-
-        df = _fetch_special(batch_rics, batch_start, end_date)
-        if df is not None and not df.empty:
-            n = _write_records(df)
-            total_written += n
-            print(f"    special batch {i // BATCH_SIZE + 1}: {n} rows ({batch_rics[0]}…)")
-        else:
-            print(f"    special batch {i // BATCH_SIZE + 1}: no data ({batch_rics[0]}…)")
-
-        time.sleep(SLEEP_TIME)
-
-    print(f"fetch_dividends done. Total rows written: {total_written}")
+        run_finish(run_id, rows_written=total_written)
+        logger.info('fetch_dividends done. rows_written=%d', total_written)
+    except Exception as e:
+        run_finish(run_id, error=str(e))
+        raise
 
 
 if __name__ == '__main__':

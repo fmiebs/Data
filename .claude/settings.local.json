@@ -93,7 +93,17 @@
       "Bash(tasklist //FI \"PID eq 14264\")",
       "Skill(schedule)",
       "Bash(tasklist:*)",
-      "Bash(grep -l \"46888\\\\|31184\\\\|41916\\\\|45312\" logs/chain_builder_*.log)"
+      "Bash(grep -l \"46888\\\\|31184\\\\|41916\\\\|45312\" logs/chain_builder_*.log)",
+      "WebFetch(domain:community.developers.refinitiv.com)",
+      "WebFetch(domain:www.lseg.com)",
+      "WebFetch(domain:developers.lseg.com)",
+      "WebFetch(domain:community.developers.lseg.com)",
+      "WebFetch(domain:www.northstarrisk.com)",
+      "WebFetch(domain:www.cmegroup.com)",
+      "Bash(pkill -f \"fetch_index_prices_daily\")",
+      "Bash(pkill -f \"fetch_fx_rates\")",
+      "Bash(pkill -f \"compute_index_mcap\")",
+      "Bash(echo \"PID: $!\")"
     ]
   }
 }

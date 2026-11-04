@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS pub_config.stock_indices (
     active                         BOOLEAN DEFAULT TRUE
 );
 
+CREATE TABLE IF NOT EXISTS pub_config.fx_pairs (
+    from_crncy   CHAR(3)   NOT NULL,
+    to_crncy     CHAR(3)   NOT NULL,
+    eikon_ric    VARCHAR   NOT NULL,
+    invert       BOOLEAN   NOT NULL DEFAULT FALSE,
+    active       BOOLEAN   DEFAULT TRUE,
+    PRIMARY KEY (from_crncy, to_crncy)
+);
+
 CREATE TABLE IF NOT EXISTS pub_config.futures_underlyings (
     underlying_ric    VARCHAR PRIMARY KEY,
     underlying_name   VARCHAR,
@@ -106,6 +115,8 @@ CREATE TABLE IF NOT EXISTS pub_equity.stock_prices_daily (
     high_price   NUMERIC(20,6),
     low_price    NUMERIC(20,6),
     volume       NUMERIC(20,0),
+    market_cap   NUMERIC(24,2),
+    mcap_crncy   CHAR(3),
     crncy        VARCHAR(3)    NOT NULL DEFAULT 'LOC',
     source       CHAR(2)       DEFAULT 'EK',
     created_at   TIMESTAMPTZ   DEFAULT now(),
@@ -138,11 +149,48 @@ CREATE TABLE IF NOT EXISTS pub_equity.stock_fundamentals_quarterly (
     gics_industry        VARCHAR(64),
     gics_sub_industry    VARCHAR(64),
     reporting_ccy        VARCHAR(3),
+    free_float_pct       NUMERIC(8,4),
+    sic_code             VARCHAR(8),
+    sic_industry         VARCHAR(128),
+    trbc_economic_sector VARCHAR(64),
+    org_permid           VARCHAR(20),
     gics_backfill        BOOLEAN,
     source               CHAR(2)      DEFAULT 'EK',
     created_at           TIMESTAMPTZ  DEFAULT now(),
     PRIMARY KEY (ric, period_end_date)
 );
+
+CREATE TABLE IF NOT EXISTS pub_equity.stock_splits (
+    ric          VARCHAR(50)   NOT NULL,
+    ex_date      DATE          NOT NULL,
+    adj_factor   NUMERIC(18,8) NOT NULL,  -- TR.CAAdjustmentFactor: 5:1-Split = 0.2
+    source       CHAR(2)       DEFAULT 'EK',
+    created_at   TIMESTAMPTZ   DEFAULT now(),
+    PRIMARY KEY (ric, ex_date)
+);
+
+CREATE TABLE IF NOT EXISTS pub_equity.index_mcap (
+    index_ric    VARCHAR(50)   NOT NULL,
+    trade_date   DATE          NOT NULL,
+    mcap_local   NUMERIC(20,0),
+    crncy        CHAR(3)       NOT NULL DEFAULT 'LOC',
+    source       CHAR(2)       DEFAULT 'EK',
+    created_at   TIMESTAMPTZ   DEFAULT now(),
+    PRIMARY KEY (index_ric, trade_date)
+);
+
+CREATE TABLE IF NOT EXISTS pub_equity.computations_index_mcap (
+    date         DATE          NOT NULL,
+    index_ric    VARCHAR(50)   NOT NULL,
+    crncy        CHAR(3)       NOT NULL,
+    ff_mcap      NUMERIC(24,2),
+    mcap         NUMERIC(24,2),
+    created_at   TIMESTAMPTZ   DEFAULT now(),
+    PRIMARY KEY (date, index_ric)
+);
+
+CREATE INDEX IF NOT EXISTS idx_computations_index_mcap_date
+    ON pub_equity.computations_index_mcap (date);
 
 CREATE TABLE IF NOT EXISTS pub_equity.stock_dividends (
     ric          VARCHAR(50)  NOT NULL,
@@ -248,3 +296,78 @@ CREATE INDEX IF NOT EXISTS idx_index_prices_trade_date
 
 CREATE INDEX IF NOT EXISTS idx_usd_rates_trade_date
     ON pub_rates.usd_rates (trade_date);
+
+CREATE INDEX IF NOT EXISTS idx_index_mcap_trade_date
+    ON pub_equity.index_mcap (trade_date);
+
+CREATE INDEX IF NOT EXISTS idx_fx_rates_trade_date
+    ON pub_rates.fx_rates (trade_date);
+
+CREATE TABLE IF NOT EXISTS pub_rates.fx_forwards (
+    from_crncy    CHAR(3)        NOT NULL,
+    to_crncy      CHAR(3)        NOT NULL,  -- immer 'USD'
+    trade_date    DATE           NOT NULL,
+    tenor         VARCHAR(5)     NOT NULL,  -- '1M','2M','3M','6M','9M','1Y','18M','2Y'
+    forward_rate  NUMERIC(18,8),            -- USD per FCY (gleiche Konvention wie fx_rates.spot_rate)
+    source_system VARCHAR(32)    DEFAULT 'Eikon',
+    created_at    TIMESTAMPTZ    DEFAULT now(),
+    PRIMARY KEY (from_crncy, to_crncy, trade_date, tenor)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fx_forwards_trade_date
+    ON pub_rates.fx_forwards (trade_date);
+
+-- OIS-Kurven-Konfiguration (welche Eikon-RICs je Waehrung und Tenor)
+CREATE TABLE IF NOT EXISTS pub_config.ois_curves (
+    crncy         CHAR(3)     NOT NULL,
+    tenor         VARCHAR(10) NOT NULL,  -- '1M','3M','6M','1Y','2Y','5Y','10Y'
+    tenor_days    INTEGER     NOT NULL,
+    eikon_ric     VARCHAR     NOT NULL,
+    active        BOOLEAN     DEFAULT TRUE,
+    PRIMARY KEY (crncy, tenor)
+);
+
+-- Allgemeine Zinskurven-Tabelle (OIS, CMT, Gov je Waehrung)
+CREATE TABLE IF NOT EXISTS pub_rates.rate_curves (
+    crncy         CHAR(3)        NOT NULL,
+    curve_type    VARCHAR(20)    NOT NULL,  -- 'ois', 'cmt'
+    trade_date    DATE           NOT NULL,
+    tenor         VARCHAR(10)    NOT NULL,
+    tenor_days    INTEGER,
+    rate_type     VARCHAR(10)    NOT NULL,  -- 'par', 'zero'
+    rate_pct      NUMERIC(12,6),
+    compounding   VARCHAR(20),             -- 'annual', 'semiannual', 'continuous'
+    source_system VARCHAR(50),
+    created_at    TIMESTAMPTZ    DEFAULT now(),
+    PRIMARY KEY (crncy, curve_type, trade_date, tenor, rate_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rate_curves_trade_date
+    ON pub_rates.rate_curves (trade_date);
+
+-- ---------------------------------------------------------------------------
+-- RIC -> Unternehmen (PermID). Eine Zeile je RIC, Quelle fuer alle
+-- unternehmensweiten Aggregationen. org_permid ist ein UNTERNEHMENS-Schluessel:
+-- er gruppiert auch Aktiengattungen (FOX.OQ/FOXA.OQ) und Zweitnotierungen
+-- (NEM.AX/NEM.N) — fuer Preisreihen deshalb NICHT als Join-Key verwenden.
+-- successor_ric ist die Instrumentenebene (RIC-Wechsel) und wird kuratiert.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS pub_config.ric_org_map (
+    ric           VARCHAR(50)  NOT NULL,
+    org_permid    VARCHAR(20),
+    company_name  VARCHAR(200),
+    crncy         VARCHAR(5),
+    successor_ric VARCHAR(50),
+    first_price   DATE,
+    last_price    DATE,
+    source        CHAR(2)      DEFAULT 'EK',
+    updated_at    TIMESTAMPTZ  DEFAULT now(),
+    PRIMARY KEY (ric)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ric_org_map_permid
+    ON pub_config.ric_org_map (org_permid);
+
+ALTER TABLE pub_equity.index_constituents
+    ADD COLUMN IF NOT EXISTS org_permid VARCHAR(20);

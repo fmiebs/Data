@@ -125,12 +125,20 @@ def run(
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
+                -- letzter Snapshot <= :date je Index (Snapshots liegen auf Monatsenden)
+                WITH latest AS (
+                    SELECT DISTINCT ON (ic.index_ric) ic.index_ric, ic.snapshot_date
+                    FROM pub_equity.index_constituents ic
+                    JOIN pub_config.stock_indices si ON si.index_ric = ic.index_ric
+                    WHERE ic.snapshot_date <= :date
+                      AND si.fetch_constituent_options = TRUE
+                      AND si.active = TRUE
+                    ORDER BY ic.index_ric, ic.snapshot_date DESC
+                )
                 SELECT DISTINCT ic.constituent_ric
-                FROM pub_equity.index_constituents ic
-                JOIN pub_config.stock_indices si ON si.index_ric = ic.index_ric
-                WHERE ic.snapshot_date = :date
-                  AND si.fetch_constituent_options = TRUE
-                  AND si.active = TRUE
+                FROM latest l
+                JOIN pub_equity.index_constituents ic
+                  ON ic.index_ric = l.index_ric AND ic.snapshot_date = l.snapshot_date
             """),
             {'date': snapshot_date}
         ).fetchall()

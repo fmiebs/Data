@@ -137,10 +137,27 @@ def main() -> None:
     from modules.fetch_futures_prices import run as run_futures_prices
     run_futures_prices(snapshot_date)
 
-    # Modul 11: Index Prices
-    logger.info('--- Modul 11: Index Prices ---')
+    # Modul 11: Index Prices + Market Cap
+    logger.info('--- Modul 11: Index Prices + Market Cap ---')
     from modules.fetch_index_prices_daily import run as run_index_prices
     run_index_prices(snapshot_date)
+
+    # Modul 12: FX Rates
+    logger.info('--- Modul 12: FX Rates ---')
+    from modules.fetch_fx_rates import run as run_fx_rates
+    run_fx_rates(snapshot_date)
+
+    # Modul 13: RIC -> Unternehmen (PermID); muss vor der MCap laufen,
+    # damit neu aufgetretene RICs eine PermID haben und nicht als
+    # eigenes Unternehmen in die Entdopplung gehen.
+    logger.info('--- Modul 13: RIC/Org-Map (PermID) ---')
+    from modules.fetch_ric_org_map import run as run_ric_org_map
+    run_ric_org_map(snapshot_date)
+
+    # Modul 14: Index MCap (Berechnung aus Constituents)
+    logger.info('--- Modul 14: Index MCap (Berechnung) ---')
+    from modules.compute_index_mcap import run as run_index_mcap
+    run_index_mcap(snapshot_date)
 
     logger.info('=== Pipeline abgeschlossen ===')
 

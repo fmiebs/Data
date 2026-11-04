@@ -14,7 +14,7 @@ def try_fetch(ric, fields, params):
     return rows, err_code, df
 
 # =============================================================================
-# SCHRITT 7: Ist der März-RIC wirklich daily?
+# SCHRITT 7: Ist der März-RIC wirklich daily?claude --version
 # =============================================================================
 print("=== SCHRITT 7: März 2026 — täglich? (kein Frq) ===")
 rows, ec, df = try_fetch('HSI16700C6.HF',

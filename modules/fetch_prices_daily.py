@@ -1,13 +1,25 @@
 """
 fetch_prices_daily.py
 ---------------------
-Fetches daily OHLCV prices for all SPX constituents.
+Fetches daily OHLCV prices for all constituents of indices where
+fetch_constituent_prices=TRUE in pub_config.stock_indices.
 Writes to pub_equity.stock_prices_daily.
 
 Delta logic per RIC:
   - No existing rows  -> start_date = today - HISTORY_YEARS
   - Existing rows     -> start_date = MAX(trade_date) + 1 day
   - start_date > today -> skip
+
+Backfill (start_date gesetzt): RICs, deren Historie bereits bis start_date
+zurueckreicht, werden nur ab MAX(trade_date)+1 ergaenzt; alle anderen ab start_date.
+
+market_cap kommt aus TR.CompanyMarketCap. NICHT close_price * shares_outstanding
+verwenden: Preise sind splitbereinigt, shares_outstanding nicht -> MCap vor jedem
+Split zu niedrig (AMZN 2021: 85 Mrd. statt 1.691 Mrd.).
+
+Waehrungen: crncy = Kurswaehrung (LSE: 'GBp' = Pence!), mcap_crncy = Waehrung der
+MCap (LSE: 'GBP'). Eikon liefert beide als Spalte 'Currency' — Zuordnung ueber die
+jeweils vorhergehende Wertspalte (_dedupe_currency_cols).
 """
 import logging
 import time
@@ -43,24 +55,37 @@ def _get_prices_table():
 
 
 def _get_start_date(conn, ric: str, override_start: date | None = None) -> date | None:
-    if override_start is not None:
-        return override_start
-    row = conn.execute(
-        text(f"SELECT MAX(trade_date) FROM {SCHEMA}.{TABLE} WHERE ric = :ric"),
+    first, last = conn.execute(
+        text(f"SELECT MIN(trade_date), MAX(trade_date) FROM {SCHEMA}.{TABLE} WHERE ric = :ric"),
         {'ric': ric}
-    ).scalar()
+    ).fetchone()
     today = date.today()
-    start = (today.replace(year=today.year - HISTORY_YEARS) if row is None
-             else row + timedelta(days=1))
+    if override_start is not None and (first is None or first > override_start):
+        return override_start
+    start = (today.replace(year=today.year - HISTORY_YEARS) if last is None
+             else last + timedelta(days=1))
     return None if start > today else start
+
+
+def _dedupe_currency_cols(columns: list) -> list:
+    """'Currency' kommt je Wertfeld einmal — an die vorhergehende Wertspalte binden."""
+    out, prev = [], None
+    for c in columns:
+        if c == 'Currency' and prev is not None:
+            out.append(f'{prev} Currency')
+        else:
+            out.append(c)
+            prev = c
+    return out
 
 
 def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFrame | None:
     result = eikon_fetch(
         ek.get_data,
         rics,
-        ['TR.PriceClose.Date', 'TR.PriceClose', 'TR.PriceOpen',
-         'TR.PriceHigh', 'TR.PriceLow', 'TR.Volume'],
+        ['TR.PriceClose.Date', 'TR.PriceClose', 'TR.PriceClose.currency',
+         'TR.PriceOpen', 'TR.PriceHigh', 'TR.PriceLow', 'TR.Volume',
+         'TR.CompanyMarketCap', 'TR.CompanyMarketCap.currency'],
         {'SDate': start_date.strftime('%Y-%m-%d'),
          'EDate': end_date.strftime('%Y-%m-%d'),
          'Frq':   'D'},
@@ -82,6 +107,8 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
         logger.warning('No date column in batch (cols: %s)', list(data.columns))
         return None
 
+    data.columns = _dedupe_currency_cols(list(data.columns))
+
     df = data.rename(columns={
         'Instrument':  'ric',
         date_col:      'trade_date',
@@ -90,6 +117,9 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
         'Price High':  'high_price',
         'Price Low':   'low_price',
         'Volume':      'volume',
+        'Price Close Currency':        'crncy',
+        'Company Market Cap':          'market_cap',
+        'Company Market Cap Currency': 'mcap_crncy',
     })
 
     if 'ric' not in df.columns:
@@ -99,15 +129,19 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
     df['trade_date'] = pd.to_datetime(df['trade_date']).dt.date
     df = df.dropna(subset=['trade_date'])
 
-    for col in ('close_price', 'open_price', 'high_price', 'low_price', 'volume'):
+    for col in ('close_price', 'open_price', 'high_price', 'low_price', 'volume',
+                'market_cap', 'crncy', 'mcap_crncy'):
         if col not in df.columns:
             df[col] = None
         else:
-            df[col] = df[col].where(df[col].notna(), other=None)
+            df[col] = df[col].astype(object).where(
+                df[col].notna() & (df[col].astype(str).str.strip() != ''), other=None)
 
-    df['crncy'] = 'LOC'
+    # crncy ist NOT NULL — 'LOC' als Fallback wenn Eikon keine Waehrung liefert
+    df['crncy'] = [c if c else 'LOC' for c in df['crncy']]
     return df[['ric', 'trade_date', 'close_price', 'open_price',
-               'high_price', 'low_price', 'volume', 'crncy']]
+               'high_price', 'low_price', 'volume', 'crncy',
+               'market_cap', 'mcap_crncy']]
 
 
 def run(
@@ -123,10 +157,13 @@ def run(
     run_id = run_start('fetch_prices_daily', mode, snapshot_date)
 
     with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT DISTINCT constituent_ric "
-                 "FROM pub_equity.index_constituents WHERE index_ric = '.SPX'")
-        ).fetchall()
+        rows = conn.execute(text("""
+            SELECT DISTINCT ic.constituent_ric
+            FROM pub_equity.index_constituents ic
+            JOIN pub_config.stock_indices si ON si.index_ric = ic.index_ric
+            WHERE si.fetch_constituent_prices = TRUE
+              AND si.active = TRUE
+        """)).fetchall()
 
     all_rics = [r[0] for r in rows]
     logger.info('%d RICs in universe', len(all_rics))
@@ -138,7 +175,8 @@ def run(
             if s is not None:
                 ric_starts[ric] = s
 
-    rics_to_fetch = list(ric_starts.keys())
+    # nach Startdatum sortieren, damit ein Batch nicht die Historie anderer RICs mitzieht
+    rics_to_fetch = sorted(ric_starts, key=ric_starts.get)
     logger.info('%d RICs to fetch', len(rics_to_fetch))
 
     tbl           = _get_prices_table()
@@ -163,6 +201,8 @@ def run(
                         'low_price':   pg_insert(tbl).excluded.low_price,
                         'volume':      pg_insert(tbl).excluded.volume,
                         'crncy':       pg_insert(tbl).excluded.crncy,
+                        'market_cap':  pg_insert(tbl).excluded.market_cap,
+                        'mcap_crncy':  pg_insert(tbl).excluded.mcap_crncy,
                     }
                 )
                 with engine.begin() as conn:

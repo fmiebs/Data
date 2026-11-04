@@ -251,3 +251,26 @@ def build_option_ric_hist(option_ric: str, expiry_date: datetime.date) -> str:
     suffix_letter = _CALL_LETTERS_UC[expiry_date.month - 1]
     yy = str(expiry_date.year)[-2:]
     return f'{option_ric}^{suffix_letter}{yy}'
+
+
+# ---------------------------------------------------------------------------
+# Organization PermID
+# ---------------------------------------------------------------------------
+
+def normalize_permid(value) -> str | None:
+    """
+    Normalisiert TR.OrganizationID auf eine reine Ziffernfolge.
+
+    Eikon liefert die PermID numerisch. Ohne Cast landet '5001437821.0' als
+    VARCHAR in der DB, und jede Entdopplung je Unternehmen greift nicht mehr:
+    dieselbe Firma bekommt zwei org_key-Werte und zaehlt doppelt.
+    """
+    if value is None or value != value:          # None oder NaN
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in ('nan', 'none', '<na>'):
+        return None
+    try:
+        return str(int(float(s)))
+    except (TypeError, ValueError):
+        return s

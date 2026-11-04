@@ -124,6 +124,8 @@ def step_4b(conn) -> None:
         ('futures','future', 'fetch_futures_chains',           'TR.FutExpirDate',           'futures_chains',            'pub_futures',  'futures_chains',            'expiry_date',         'EK'),
         ('futures','future', 'fetch_futures_prices',           'TR.BidPrice',               'futures_prices',            'pub_futures',  'futures_prices',            'price_bid',           'EK'),
         ('futures','future', 'fetch_futures_prices',           'TR.SettlePrice',            'futures_prices',            'pub_futures',  'futures_prices',            'price_settle',        'EK'),
+        ('equity', 'index',  'fetch_index_prices_daily',       'TR.IndexMarketCap',         'index_mcap',                'pub_equity',   'index_mcap',                'mcap_local',          'EK'),
+        ('rates',  'fx',     'fetch_fx_rates',                 'TR.PriceClose',             'fx_rates',                  'pub_rates',    'fx_rates',                  'spot_rate',           'EK'),
     ]
 
     for domain, entity_type, module, eikon_field, logical_name, tgt_schema, tgt_table, tgt_col, src in rows:
@@ -570,6 +572,299 @@ def step_4i(conn) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 4j  pub_equity.index_mcap + pub_config.fx_pairs
+# ---------------------------------------------------------------------------
+
+def step_4j(conn) -> None:
+    log.info('=== 4j: index_mcap + fx_pairs ===')
+
+    # --- pub_equity.index_mcap ---
+    # Tabelle existiert bereits (manuell angelegt), aber mit abweichenden Spaltennamen/-typen.
+    # Korrekturen: date->trade_date, mcap->mcap_local, crncy numeric->CHAR(3), PK neu setzen.
+    mcap_cols = {
+        row[0] for row in conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='pub_equity' AND table_name='index_mcap'"
+        ))
+    }
+
+    if mcap_cols:
+        # Spalten umbenennen
+        if 'date' in mcap_cols and 'trade_date' not in mcap_cols:
+            _exec(conn,
+                  "ALTER TABLE pub_equity.index_mcap RENAME COLUMN date TO trade_date",
+                  'RENAME index_mcap.date -> trade_date')
+        if 'mcap' in mcap_cols and 'mcap_local' not in mcap_cols:
+            _exec(conn,
+                  "ALTER TABLE pub_equity.index_mcap RENAME COLUMN mcap TO mcap_local",
+                  'RENAME index_mcap.mcap -> mcap_local')
+
+        # crncy: numeric -> CHAR(3); bestehende 4 Testzeilen werden NULL gesetzt (kein Datenverlust relevant)
+        crncy_type = conn.execute(text(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema='pub_equity' AND table_name='index_mcap' AND column_name='crncy'"
+        )).scalar()
+        if crncy_type and crncy_type != 'character':
+            _exec(conn,
+                  "ALTER TABLE pub_equity.index_mcap ALTER COLUMN crncy TYPE CHAR(3) USING NULL",
+                  'ALTER index_mcap.crncy TYPE CHAR(3)')
+            _exec(conn,
+                  "ALTER TABLE pub_equity.index_mcap ALTER COLUMN crncy SET DEFAULT 'LOC'",
+                  'SET DEFAULT index_mcap.crncy')
+
+        # source: sicherstellen CHAR(2)
+        _exec(conn,
+              "ALTER TABLE pub_equity.index_mcap ALTER COLUMN source TYPE CHAR(2) USING source::CHAR(2)",
+              'ALTER index_mcap.source TYPE CHAR(2)')
+
+        # NOT NULL auf crncy setzen (nur wenn keine NULLs vorhanden)
+        _exec(conn,
+              "UPDATE pub_equity.index_mcap SET crncy = 'LOC' WHERE crncy IS NULL",
+              'UPDATE index_mcap.crncy NULL -> LOC')
+        _exec(conn,
+              "ALTER TABLE pub_equity.index_mcap ALTER COLUMN crncy SET NOT NULL",
+              'SET NOT NULL index_mcap.crncy')
+
+        # PK: alten droppen, neuen auf (index_ric, trade_date) setzen
+        pk_name = conn.execute(text("""
+            SELECT tc.constraint_name
+            FROM information_schema.table_constraints tc
+            WHERE tc.table_schema = 'pub_equity'
+              AND tc.table_name   = 'index_mcap'
+              AND tc.constraint_type = 'PRIMARY KEY'
+        """)).scalar()
+        if pk_name:
+            # Prüfen ob PK bereits korrekt
+            pk_cols = [row[0] for row in conn.execute(text("""
+                SELECT kcu.column_name
+                FROM information_schema.key_column_usage kcu
+                WHERE kcu.constraint_name = :pk AND kcu.table_schema = 'pub_equity'
+                ORDER BY kcu.ordinal_position
+            """), {'pk': pk_name})]
+            if pk_cols != ['index_ric', 'trade_date']:
+                _exec(conn,
+                      f"ALTER TABLE pub_equity.index_mcap DROP CONSTRAINT {pk_name}",
+                      f'DROP PK {pk_name}')
+                _exec(conn,
+                      "ALTER TABLE pub_equity.index_mcap ADD PRIMARY KEY (index_ric, trade_date)",
+                      'ADD PK (index_ric, trade_date)')
+        else:
+            _exec(conn,
+                  "ALTER TABLE pub_equity.index_mcap ADD PRIMARY KEY (index_ric, trade_date)",
+                  'ADD PK (index_ric, trade_date)')
+
+        # created_at ergänzen
+        _exec(conn,
+              "ALTER TABLE pub_equity.index_mcap ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()",
+              'ADD COLUMN index_mcap.created_at')
+
+    else:
+        # Tabelle noch nicht vorhanden: frisch anlegen
+        _exec(conn, """
+            CREATE TABLE IF NOT EXISTS pub_equity.index_mcap (
+                index_ric    VARCHAR(50)   NOT NULL,
+                trade_date   DATE          NOT NULL,
+                mcap_local   NUMERIC(20,0),
+                crncy        CHAR(3)       NOT NULL DEFAULT 'LOC',
+                source       CHAR(2)       DEFAULT 'EK',
+                created_at   TIMESTAMPTZ   DEFAULT now(),
+                PRIMARY KEY (index_ric, trade_date)
+            )
+        """, 'CREATE TABLE pub_equity.index_mcap')
+
+    _exec(conn,
+          'CREATE INDEX IF NOT EXISTS idx_index_mcap_trade_date '
+          'ON pub_equity.index_mcap (trade_date)',
+          'CREATE INDEX idx_index_mcap_trade_date')
+
+    # --- pub_config.fx_pairs ---
+    _exec(conn, """
+        CREATE TABLE IF NOT EXISTS pub_config.fx_pairs (
+            from_crncy   CHAR(3)   NOT NULL,
+            to_crncy     CHAR(3)   NOT NULL,
+            eikon_ric    VARCHAR   NOT NULL,
+            invert       BOOLEAN   NOT NULL DEFAULT FALSE,
+            active       BOOLEAN   DEFAULT TRUE,
+            PRIMARY KEY (from_crncy, to_crncy)
+        )
+    """, 'CREATE TABLE pub_config.fx_pairs')
+
+    # invert-Spalte nachrüsten falls fx_pairs bereits existiert und invert fehlt
+    _exec(conn,
+          "ALTER TABLE pub_config.fx_pairs ADD COLUMN IF NOT EXISTS invert BOOLEAN NOT NULL DEFAULT FALSE",
+          'ADD COLUMN fx_pairs.invert')
+
+    # fx_pairs befüllen (idempotent)
+    fx_rows = [
+        # from_crncy, to_crncy, eikon_ric, invert
+        ('AUD', 'USD', 'AUD=', False),   # USD per AUD — direkt
+        ('EUR', 'USD', 'EUR=', False),   # USD per EUR — direkt
+        ('GBP', 'USD', 'GBP=', False),   # USD per GBP — direkt
+        ('CAD', 'USD', 'CAD=', True),    # CAD per USD — invertieren
+        ('CHF', 'USD', 'CHF=', True),    # CHF per USD — invertieren
+        ('HKD', 'USD', 'HKD=', True),    # HKD per USD — invertieren
+        ('KRW', 'USD', 'KRW=', True),    # KRW per USD — invertieren
+    ]
+    for from_c, to_c, ric, inv in fx_rows:
+        existing = conn.execute(text(
+            "SELECT 1 FROM pub_config.fx_pairs WHERE from_crncy = :fc AND to_crncy = :tc"
+        ), {'fc': from_c, 'tc': to_c}).scalar()
+        if not existing:
+            conn.execute(text("""
+                INSERT INTO pub_config.fx_pairs (from_crncy, to_crncy, eikon_ric, invert, active)
+                VALUES (:fc, :tc, :ric, :inv, TRUE)
+            """), {'fc': from_c, 'tc': to_c, 'ric': ric, 'inv': inv})
+    log.info('  fx_pairs rows OK')
+
+    # --- pub_rates.fx_rates: fehlende Spalten ergänzen ---
+    for col_sql, label in [
+        ("ADD COLUMN IF NOT EXISTS source_system VARCHAR(32)", 'fx_rates.source_system'),
+        ("ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()", 'fx_rates.created_at'),
+    ]:
+        _exec(conn, f"ALTER TABLE pub_rates.fx_rates {col_sql}", label)
+
+    _exec(conn,
+          "ALTER TABLE pub_equity.stock_fundamentals_quarterly "
+          "ADD COLUMN IF NOT EXISTS free_float_pct NUMERIC(8,4)",
+          'ADD COLUMN stock_fundamentals_quarterly.free_float_pct')
+
+    _exec(conn, """
+        CREATE TABLE IF NOT EXISTS pub_equity.computations_index_mcap (
+            date         DATE          NOT NULL,
+            index_ric    VARCHAR(50)   NOT NULL,
+            crncy        CHAR(3)       NOT NULL,
+            ff_mcap      NUMERIC(24,2),
+            mcap         NUMERIC(24,2),
+            created_at   TIMESTAMPTZ   DEFAULT now(),
+            PRIMARY KEY (date, index_ric)
+        )
+    """, 'CREATE TABLE pub_equity.computations_index_mcap')
+
+    _exec(conn,
+          'CREATE INDEX IF NOT EXISTS idx_computations_index_mcap_date '
+          'ON pub_equity.computations_index_mcap (date)',
+          'CREATE INDEX idx_computations_index_mcap_date')
+
+    _exec(conn,
+          "ALTER TABLE pub_rates.fx_rates "
+          "ADD CONSTRAINT fx_rates_pkey PRIMARY KEY (trade_date, from_crncy, to_crncy)",
+          'ADD PK fx_rates (trade_date, from_crncy, to_crncy)')
+
+    _exec(conn,
+          'CREATE INDEX IF NOT EXISTS idx_fx_rates_trade_date '
+          'ON pub_rates.fx_rates (trade_date)',
+          'CREATE INDEX idx_fx_rates_trade_date')
+
+
+# ---------------------------------------------------------------------------
+# 4k  SIC + TRBC in stock_fundamentals_quarterly
+# ---------------------------------------------------------------------------
+
+def step_4k(conn) -> None:
+    log.info('Schritt 4k: SIC/TRBC-Spalten in stock_fundamentals_quarterly')
+    for col_sql, label in [
+        ("ADD COLUMN IF NOT EXISTS sic_code VARCHAR(8)",              'sic_code'),
+        ("ADD COLUMN IF NOT EXISTS sic_industry VARCHAR(128)",        'sic_industry'),
+        ("ADD COLUMN IF NOT EXISTS trbc_economic_sector VARCHAR(64)", 'trbc_economic_sector'),
+    ]:
+        _exec(conn, f"ALTER TABLE pub_equity.stock_fundamentals_quarterly {col_sql}",
+              f'ADD COLUMN stock_fundamentals_quarterly.{label}')
+
+
+# ---------------------------------------------------------------------------
+# 4l  market_cap in stock_prices_daily
+# ---------------------------------------------------------------------------
+
+def step_4l(conn) -> None:
+    log.info('Schritt 4l: market_cap-Spalten in stock_prices_daily')
+    for col_sql, label in [
+        ("ADD COLUMN IF NOT EXISTS market_cap NUMERIC(24,2)", 'market_cap'),
+        ("ADD COLUMN IF NOT EXISTS mcap_crncy CHAR(3)",       'mcap_crncy'),
+    ]:
+        _exec(conn, f"ALTER TABLE pub_equity.stock_prices_daily {col_sql}",
+              f'ADD COLUMN stock_prices_daily.{label}')
+
+
+# ---------------------------------------------------------------------------
+# 4m  org_permid in stock_fundamentals_quarterly
+# ---------------------------------------------------------------------------
+
+def step_4m(conn) -> None:
+    log.info('Schritt 4m: org_permid in stock_fundamentals_quarterly')
+    _exec(conn,
+          "ALTER TABLE pub_equity.stock_fundamentals_quarterly "
+          "ADD COLUMN IF NOT EXISTS org_permid VARCHAR(20)",
+          'ADD COLUMN stock_fundamentals_quarterly.org_permid')
+
+
+# ---------------------------------------------------------------------------
+# 4n  pub_equity.stock_splits (Kapitalmassnahmen / Preisanpassungsfaktoren)
+# ---------------------------------------------------------------------------
+
+def step_4n(conn) -> None:
+    log.info('Schritt 4n: pub_equity.stock_splits')
+    _exec(conn, """
+        CREATE TABLE IF NOT EXISTS pub_equity.stock_splits (
+            ric         VARCHAR(50)  NOT NULL,
+            ex_date     DATE         NOT NULL,
+            adj_factor  NUMERIC(18,8) NOT NULL,  -- Eikon TR.CAAdjustmentFactor (5:1-Split = 0.2)
+            source      CHAR(2)      DEFAULT 'EK',
+            created_at  TIMESTAMPTZ  DEFAULT now(),
+            PRIMARY KEY (ric, ex_date)
+        )
+    """, 'CREATE TABLE pub_equity.stock_splits')
+
+
+def step_4o(conn) -> None:
+    log.info('Schritt 4o: pub_config.ric_org_map + index_constituents.org_permid')
+    _exec(conn, """
+        CREATE TABLE IF NOT EXISTS pub_config.ric_org_map (
+            ric           VARCHAR(50)  NOT NULL,
+            org_permid    VARCHAR(20),
+            company_name  VARCHAR(200),
+            crncy         VARCHAR(5),
+            successor_ric VARCHAR(50),
+            first_price   DATE,
+            last_price    DATE,
+            source        CHAR(2)      DEFAULT 'EK',
+            updated_at    TIMESTAMPTZ  DEFAULT now(),
+            PRIMARY KEY (ric)
+        )
+    """, 'CREATE TABLE pub_config.ric_org_map')
+
+    _exec(conn, """
+        CREATE INDEX IF NOT EXISTS idx_ric_org_map_permid
+            ON pub_config.ric_org_map (org_permid)
+    """, 'CREATE INDEX idx_ric_org_map_permid')
+
+    _exec(conn, """
+        ALTER TABLE pub_equity.index_constituents
+            ADD COLUMN IF NOT EXISTS org_permid VARCHAR(20)
+    """, 'ALTER index_constituents ADD org_permid')
+
+    # Registrierung in pub_config.data_sources (damit get_table() greift)
+    for domain, entity, module, field, logical, schema_, table, column in (
+        ('equity', 'stock', 'fetch_ric_org_map', 'TR.OrganizationID',
+         'ric_org_map', 'pub_config', 'ric_org_map', 'org_permid'),
+        ('equity', 'stock', 'fetch_ric_org_map', 'TR.CommonName',
+         'ric_org_map', 'pub_config', 'ric_org_map', 'company_name'),
+        ('equity', 'index', 'fetch_constituents', 'TR.OrganizationID',
+         'index_constituents', 'pub_equity', 'index_constituents', 'org_permid'),
+    ):
+        _exec(conn, f"""
+            INSERT INTO pub_config.data_sources
+                (domain, entity_type, module, eikon_field, logical_name,
+                 target_schema, target_table, target_column, source_code, active)
+            SELECT '{domain}', '{entity}', '{module}', '{field}', '{logical}',
+                   '{schema_}', '{table}', '{column}', 'EK', TRUE
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pub_config.data_sources
+                WHERE logical_name = '{logical}' AND target_column = '{column}'
+                  AND target_table = '{table}')
+        """, f'data_sources: {logical}.{column}')
+
+
+# ---------------------------------------------------------------------------
 # Hauptprogramm
 # ---------------------------------------------------------------------------
 
@@ -587,6 +882,12 @@ def main() -> None:
         ('4g', step_4g),
         ('4h', step_4h),
         ('4i', step_4i),
+        ('4j', step_4j),
+        ('4k', step_4k),
+        ('4l', step_4l),
+        ('4m', step_4m),
+        ('4n', step_4n),
+        ('4o', step_4o),
     ]
 
     for label, fn in steps:

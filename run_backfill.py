@@ -45,10 +45,30 @@ def main(start: str = DEFAULT_START, end: str | None = None) -> None:
     from modules.fetch_dividends import run as run_div
     run_div(mode='backfill', start_date=start, end_date=end)
 
-    # Indexpreise
-    logger.info('--- Backfill: index_prices_daily ---')
+    # Indexpreise + Market Cap
+    logger.info('--- Backfill: index_prices_daily + index_mcap ---')
     from modules.fetch_index_prices_daily import run as run_idx
     run_idx(mode='backfill', start_date=start, end_date=end)
+
+    # FX Rates
+    logger.info('--- Backfill: fx_rates ---')
+    from modules.fetch_fx_rates import run as run_fx_rates
+    run_fx_rates(mode='backfill', start_date=start, end_date=end)
+
+    # FX Forwards
+    logger.info('--- Backfill: fx_forwards ---')
+    from modules.fetch_fx_forwards import run as run_fx_forwards
+    run_fx_forwards(mode='backfill', start_date=start, end_date=end)
+
+    # OIS Rate Curves (USD, EUR, GBP aktiv; AUD/CHF nach RIC-Verifikation)
+    logger.info('--- Backfill: ois_rates ---')
+    from modules.fetch_ois_rates import run as run_ois
+    run_ois(mode='backfill', start_date=start, end_date=end)
+
+    # Government Rate Curves (alle Waehrungen nach RIC-Verifikation aktiv)
+    logger.info('--- Backfill: gov_rates ---')
+    from modules.fetch_gov_rates import run as run_gov
+    run_gov(mode='backfill', start_date=start, end_date=end)
 
     # USD Rates
     logger.info('--- Backfill: usd_rates ---')
@@ -64,6 +84,16 @@ def main(start: str = DEFAULT_START, end: str | None = None) -> None:
     logger.info('--- Backfill: futures_prices ---')
     from modules.fetch_futures_prices import run as run_fut_prices
     run_fut_prices(mode='backfill', start_date=start, end_date=end)
+
+    # RIC -> Unternehmen (PermID) — Voraussetzung fuer die Entdopplung
+    logger.info('--- Backfill: ric_org_map ---')
+    from modules.fetch_ric_org_map import run as run_ric_org_map
+    run_ric_org_map(mode='live')
+
+    # Index MCap (Berechnung)
+    logger.info('--- Backfill: computations_index_mcap ---')
+    from modules.compute_index_mcap import run as run_index_mcap
+    run_index_mcap(mode='backfill', start_date=start, end_date=end)
 
     logger.info('=== Backfill abgeschlossen ===')
 

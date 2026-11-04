@@ -1,13 +1,23 @@
 """
 fetch_fundamentals_quarterly.py
 ---------------------------------
-Fetches quarterly fundamentals for all SPX constituents.
+Fetches quarterly fundamentals for all constituents of indices where
+fetch_constituent_fundamentals=TRUE in pub_config.stock_indices.
 Writes to pub_equity.stock_fundamentals_quarterly.
 
 Delta logic per RIC:
   - No existing rows  -> start_date = today - HISTORY_YEARS
   - Existing rows     -> start_date = MAX(period_end_date) + 1 day
   - start_date > today -> skip
+
+Klassifikationen (GICS, SIC, TRBC) sind in Eikon statisch: sie kommen nur in der
+ersten Zeile je RIC und Abruf, alle anderen Quartale sind leer. Nach dem Schreiben
+werden sie je RIC mit dem juengsten bekannten Wert aufgefuellt (gics_backfill=TRUE).
+Delistete RICs ('^'-Suffix) liefern kein GICS, aber SIC und TRBC.
+
+org_permid (TR.OrganizationID) ist je Unternehmen gleich fuer alle Aktiengattungen
+(GOOGL.OQ = GOOG.OQ) — noetig, weil TR.CompanyMarketCap die MCap des Unternehmens
+liefert und Doppelgattungen sonst doppelt gezaehlt werden.
 """
 import logging
 import time
@@ -60,9 +70,12 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
         ek.get_data,
         rics,
         ['TR.BookValuePerShare.periodenddate', 'TR.BookValuePerShare',
-         'TR.TotalEquity', 'TR.SharesOutstanding',
+         'TR.TotalEquity', 'TR.SharesOutstanding', 'TR.FreeFloatPct',
+         'TR.FreeFloatPct.calcdate',
          'TR.GICSSector', 'TR.GICSIndustryGroup', 'TR.GICSIndustry',
-         'TR.GICSSubIndustry', 'TR.ReportCurrency'],
+         'TR.GICSSubIndustry', 'TR.ReportCurrency',
+         'TR.SICIndustryCode', 'TR.SICIndustry', 'TR.TRBCEconomicSector',
+         'TR.OrganizationID'],
         {'SDate': start_date.strftime('%Y-%m-%d'),
          'EDate': end_date.strftime('%Y-%m-%d'),
          'Period': 'FQ0', 'Frq': 'FQ'},
@@ -79,9 +92,23 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
          if c is not None and 'periodend' in c.lower().replace(' ', '')),
         None
     )
-    if date_col is None:
+    calcdate_col = next(
+        (c for c in data.columns
+         if c is not None and c.lower().replace(' ', '') == 'calcdate'),
+        None
+    )
+    if date_col is None and calcdate_col is None:
         logger.warning('No period end date column (cols: %s)', list(data.columns))
         return None
+
+    # Use period end date as primary; calcdate as fallback for non-US stocks
+    if date_col is not None and calcdate_col is not None:
+        data[date_col] = data[date_col].where(
+            data[date_col].notna() & (data[date_col] != ''),
+            other=data[calcdate_col]
+        )
+    elif date_col is None:
+        date_col = calcdate_col
 
     col_map = {
         'Instrument':               'ric',
@@ -89,6 +116,7 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
         'Book Value Per Share':     'book_value_per_share',
         'Total Equity':             'book_equity',
         'Outstanding Shares':       'shares_outstanding',
+        'Free Float (Percent)':     'free_float_pct',
         'GICS Sector Name':         'gics_sector',
         'GICS Sector Code':         'gics_sector',
         'GICS Industry Group Name': 'gics_industry_group',
@@ -98,6 +126,10 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
         'GICS Sub-Industry Name':   'gics_sub_industry',
         'GICS Sub-Industry Code':   'gics_sub_industry',
         'Report Currency':          'reporting_ccy',
+        'SIC Industry Code':        'sic_code',
+        'SIC Industry Name':        'sic_industry',
+        'TRBC Economic Sector Name': 'trbc_economic_sector',
+        'Organization PermID':       'org_permid',
     }
     df = data.rename(columns=col_map)
 
@@ -117,14 +149,21 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
         return None
 
     for col in ('book_value_per_share', 'book_equity', 'shares_outstanding',
-                'gics_sector', 'gics_industry_group', 'gics_industry',
-                'gics_sub_industry', 'reporting_ccy'):
+                'free_float_pct', 'gics_sector', 'gics_industry_group', 'gics_industry',
+                'gics_sub_industry', 'reporting_ccy', 'sic_code', 'sic_industry',
+                'trbc_economic_sector', 'org_permid'):
         if col not in df.columns:
             df[col] = None
         else:
-            df[col] = df[col].where(df[col].notna(), other=None)
+            df[col] = df[col].astype(object).where(
+                df[col].notna() & (df[col].astype(str).str.strip() != ''), other=None)
 
-    if df['shares_outstanding'].notna().any():
+    df['sic_code'] = [None if v is None else str(int(float(v))) for v in df['sic_code']]
+    # Eikon liefert die PermID numerisch -> ohne Cast landet '5001437821.0' in der
+    # VARCHAR-Spalte und die Entdopplung je Unternehmen greift nicht mehr.
+    df['org_permid'] = [None if v is None else str(int(float(v))) for v in df['org_permid']]
+
+    if 'shares_outstanding' in df.columns and df['shares_outstanding'].notna().any():
         df['shares_outstanding'] = df['shares_outstanding'].where(
             df['shares_outstanding'].isna(),
             df['shares_outstanding'].astype('Int64')
@@ -132,9 +171,39 @@ def _fetch_batch(rics: list[str], start_date: date, end_date: date) -> pd.DataFr
 
     valid_cols = ['ric', 'period_end_date', 'fiscal_year', 'fiscal_quarter',
                   'book_value_per_share', 'book_equity', 'shares_outstanding',
-                  'gics_sector', 'gics_industry_group', 'gics_industry',
-                  'gics_sub_industry', 'reporting_ccy']
+                  'free_float_pct', 'gics_sector', 'gics_industry_group', 'gics_industry',
+                  'gics_sub_industry', 'reporting_ccy', 'sic_code', 'sic_industry',
+                  'trbc_economic_sector', 'org_permid']
     return df[[c for c in valid_cols if c in df.columns]]
+
+
+_CLASS_COLS = ('gics_sector', 'gics_industry_group', 'gics_industry', 'gics_sub_industry',
+               'sic_code', 'sic_industry', 'trbc_economic_sector', 'org_permid')
+
+
+def _fill_classifications(conn, rics: list[str]) -> int:
+    """Fuellt leere Klassifikationen je RIC mit dem juengsten bekannten Wert."""
+    for col in _CLASS_COLS:
+        conn.execute(text(f"UPDATE {SCHEMA}.{TABLE} SET {col} = NULL "
+                          f"WHERE {col} = '' AND ric = ANY(:rics)"), {'rics': rics})
+    latest = ', '.join(
+        f"(ARRAY_AGG({c} ORDER BY period_end_date DESC) FILTER (WHERE {c} IS NOT NULL))[1] AS {c}"
+        for c in _CLASS_COLS)
+    null_any = ' OR '.join(f"f.{c} IS NULL" for c in _CLASS_COLS)
+    sets     = ', '.join(f"{c} = COALESCE(f.{c}, l.{c})" for c in _CLASS_COLS)
+    changed  = ' OR '.join(f"(f.{c} IS NULL AND l.{c} IS NOT NULL)" for c in _CLASS_COLS)
+    return conn.execute(text(f"""
+        WITH l AS (
+            SELECT ric, {latest}
+            FROM {SCHEMA}.{TABLE}
+            WHERE ric = ANY(:rics)
+            GROUP BY ric
+        )
+        UPDATE {SCHEMA}.{TABLE} f
+        SET {sets}, gics_backfill = TRUE
+        FROM l
+        WHERE f.ric = l.ric AND ({null_any}) AND ({changed})
+    """), {'rics': rics}).rowcount
 
 
 def run(
@@ -150,10 +219,13 @@ def run(
     run_id = run_start('fetch_fundamentals_quarterly', mode, snapshot_date)
 
     with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT DISTINCT constituent_ric "
-                 "FROM pub_equity.index_constituents WHERE index_ric = '.SPX'")
-        ).fetchall()
+        rows = conn.execute(text("""
+            SELECT DISTINCT ic.constituent_ric
+            FROM pub_equity.index_constituents ic
+            JOIN pub_config.stock_indices si ON si.index_ric = ic.index_ric
+            WHERE si.fetch_constituent_fundamentals = TRUE
+              AND si.active = TRUE
+        """)).fetchall()
 
     all_rics = [r[0] for r in rows]
     logger.info('%d RICs in universe', len(all_rics))
@@ -196,6 +268,10 @@ def run(
                             i // BATCH_SIZE + 1, batch_rics[0])
 
             time.sleep(SLEEP_TIME)
+
+        with engine.begin() as conn:
+            n_filled = _fill_classifications(conn, rics_to_fetch)
+        logger.info('classification fill: %d rows updated', n_filled)
 
         run_finish(run_id, rows_written=total_written)
         logger.info('fetch_fundamentals_quarterly done. rows_written=%d', total_written)

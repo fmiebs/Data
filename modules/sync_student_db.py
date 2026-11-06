@@ -22,7 +22,7 @@ Angelegte Views auf dem Ziel:
     pub_config.mv_primary_ric           Primaergattung je Unternehmen (materialisiert)
     pub_equity.v_stock_prices_company   ein Kurs je Unternehmen und Tag
     pub_equity.v_spx_companies_<LABEL>  Stichtags-Universum  <- einzige Freigabe
-                                        fuer die Rolle pm_student
+                                        fuer die Rolle FACM_students_PM
 
 Uebertragung per COPY-Strom (psycopg2 copy_expert), Preise in Jahres-Chunks.
 Idempotent: je Tabelle TRUNCATE + Neuladen, damit kein Drift entsteht.
@@ -48,7 +48,7 @@ CHUNK_FROM    = 2010          # Preise werden ab hier jahresweise uebertragen
 PM_SNAPSHOT = '2026-10-31'
 PM_LABEL    = '20261101'
 PM_VIEW     = f'pub_equity.v_spx_companies_{PM_LABEL}'
-PM_ROLE     = 'pm_student'
+PM_ROLE     = 'FACM_students_PM'   # Grossbuchstaben: in SQL immer in "..."
 
 logger = setup_logging('sync_student_db')
 
@@ -254,9 +254,9 @@ PM_VIEW_SQL = f"""
 # index_constituents oder ric_org_map.
 PM_GRANT_SQL = [
     f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{PM_ROLE}') "
-    f"THEN CREATE ROLE {PM_ROLE} NOLOGIN; END IF; END $$",
-    f'GRANT USAGE ON SCHEMA pub_equity TO {PM_ROLE}',
-    f'GRANT SELECT ON {PM_VIEW} TO {PM_ROLE}',
+    f'THEN CREATE ROLE "{PM_ROLE}" NOLOGIN; END IF; END $$',
+    f'GRANT USAGE ON SCHEMA pub_equity TO "{PM_ROLE}"',
+    f'GRANT SELECT ON {PM_VIEW} TO "{PM_ROLE}"',
 ]
 
 COMMENTS = [
